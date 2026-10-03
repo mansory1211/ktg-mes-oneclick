@@ -1,9 +1,9 @@
 #!/bin/bash
 #====================================================================================
-#  KTG-MES 苦糖果 MES 一键部署 & 管理工具 v3.0 最终稳定版
+#  KTG-MES 苦糖果 MES 一键部署 & 管理工具 v3.2 最终稳定版
 #  用法: sudo bash ktg-mes.sh
 #  默认账号: admin / admin123
-#  修复: Docker源失败/apt锁/Maven OOM/网络超时/配置缺失 等全部已知问题
+#  修复: Docker源失败/apt锁/Maven OOM/前端地址不显示/信息查询 等全部已知问题
 #====================================================================================
 set -eo pipefail
 
@@ -65,6 +65,14 @@ cmd_exists() {
     command -v "$1" &>/dev/null
 }
 
+# 自动检测前端端口
+get_frontend_port() {
+    sleep 2
+    local port
+    port=$(ss -tlnp | grep "node" | grep -oP ':\K[0-9]+' | head -1)
+    echo "$port"
+}
+
 #====================================================================================
 # 1. 系统环境初始化（全国内源 + 容错）
 #====================================================================================
@@ -88,7 +96,7 @@ env_init() {
 
     # 安装基础依赖
     info "安装基础依赖包"
-    apt install -y curl wget git unzip ca-certificates gnupg lsb-release net-tools
+    apt install -y curl wget git unzip ca-certificates gnupg lsb-release net-tools iproute2
     apt install -y openjdk-8-jdk-headless maven
     java -version 2>&1 | head -1
 
@@ -339,7 +347,7 @@ build_backend() {
 }
 
 #====================================================================================
-# 7. 启动前端
+# 7. 启动前端（自动检测端口+等待就绪）
 #====================================================================================
 start_frontend() {
     step "7/9 启动前端服务"
@@ -355,10 +363,26 @@ start_frontend() {
 
     nohup npm run dev > "$WORK_DIR/frontend.log" 2>&1 &
     echo $! > "$WORK_DIR/frontend.pid"
-    info "前端服务启动中..."
-    sleep 10
+    info "前端服务启动中，等待端口就绪..."
 
-    ok "前端服务已启动"
+    # 等待前端端口启动，最多等待60秒
+    local fe_port=""
+    for i in $(seq 1 30); do
+        fe_port=$(get_frontend_port)
+        if [ -n "$fe_port" ]; then
+            break
+        fi
+        sleep 2
+    done
+
+    if [ -z "$fe_port" ]; then
+        warn "未检测到前端端口，可手动查看日志确认"
+    else
+        ok "前端启动成功，端口 $fe_port 就绪"
+    fi
+
+    # 保存前端端口到文件，后续查询调用
+    echo "$fe_port" > "$WORK_DIR/frontend.port"
 }
 
 #====================================================================================
@@ -370,6 +394,72 @@ register_cmd() {
     cp "$SELF" /usr/local/bin/$GLOBAL_CMD
     chmod +x /usr/local/bin/$GLOBAL_CMD
     ok "全局命令注册完成，任意目录输入 $GLOBAL_CMD 即可打开管理菜单"
+}
+
+#====================================================================================
+# 9. 运行信息总览（新增功能）
+#====================================================================================
+show_info() {
+    clear
+    echo -e "${CYAN}############################################################${R}"
+    echo -e "${CYAN}#${R}${GREEN}          KTG-MES 运行信息总览            ${R}${CYAN}#${R}"
+    echo -e "${CYAN}############################################################${R}"
+    echo ""
+
+    echo -e "  ${YELLOW}【系统登录账号】${R}"
+    echo -e "  管理员账号: admin"
+    echo -e "  管理员密码: admin123"
+    echo ""
+
+    echo -e "  ${YELLOW}【数据库信息】${R}"
+    echo -e "  MySQL 地址: 127.0.0.1:${MYSQL_PORT}"
+    echo -e "  MySQL 账号: root"
+    echo -e "  MySQL 密码: ${MYSQL_ROOT_PWD}"
+    echo -e "  数据库名: ${MYSQL_DB}"
+    echo ""
+
+    echo -e "  ${YELLOW}【Redis信息】${R}"
+    echo -e "  Redis 地址: 127.0.0.1:${REDIS_PORT}"
+    echo -e "  Redis 密码: ${REDIS_PWD}"
+    echo ""
+
+    echo -e "  ${YELLOW}【访问地址】${R}"
+    local local_ip
+    local_ip=$(hostname -I | awk '{print $1}')
+    echo -e "  后端服务: http://localhost:${BACKEND_PORT}"
+    local fe_port
+    fe_port=$(cat "$WORK_DIR/frontend.port" 2>/dev/null || echo "未启动/未检测")
+    echo -e "  前端服务: http://localhost:${fe_port}"
+    echo -e "  内网访问: http://${local_ip}:${fe_port}"
+    echo ""
+
+    echo -e "  ${YELLOW}【服务运行状态】${R}"
+    if docker ps -q -f name=^${MYSQL_CONTAINER}$ >/dev/null 2>&1; then
+        echo -e "  MySQL 容器: ${GREEN}运行中${R}"
+    else
+        echo -e "  MySQL 容器: ${RED}已停止${R}"
+    fi
+
+    if docker ps -q -f name=^${REDIS_CONTAINER}$ >/dev/null 2>&1; then
+        echo -e "  Redis 容器: ${GREEN}运行中${R}"
+    else
+        echo -e "  Redis 容器: ${RED}已停止${R}"
+    fi
+
+    if pgrep -f ktg-admin.jar >/dev/null 2>&1; then
+        echo -e "  后端服务: ${GREEN}运行中${R}"
+    else
+        echo -e "  后端服务: ${RED}已停止${R}"
+    fi
+
+    if pgrep -f "npm run dev" >/dev/null 2>&1; then
+        echo -e "  前端服务: ${GREEN}运行中${R}"
+    else
+        echo -e "  前端服务: ${RED}已停止${R}"
+    fi
+    echo ""
+
+    read -p "按回车返回菜单..."
 }
 
 #====================================================================================
@@ -416,7 +506,7 @@ uninstall_all() {
 # 完整安装流程
 #====================================================================================
 install_all() {
-    echo -e "${PURPLE}############ 开始安装 KTG-MES v3.0 最终稳定版 ############${R}"
+    echo -e "${PURPLE}############ 开始安装 KTG-MES v3.2 最终稳定版 ############${R}"
     env_init
     start_db
     pull_source
@@ -426,11 +516,17 @@ install_all() {
     start_frontend
     register_cmd
 
+    local fe_port
+    fe_port=$(cat "$WORK_DIR/frontend.port" 2>/dev/null || echo "未检测到")
+    local local_ip
+    local_ip=$(hostname -I | awk '{print $1}')
+
     echo ""
     echo -e "${GREEN}############ 安装完成 ############${R}"
     echo -e "  默认账号: ${YELLOW}admin / admin123${R}"
-    echo -e "  本地访问: http://localhost:$BACKEND_PORT"
-    echo -e "  内网访问: http://$(hostname -I | awk '{print $1}'):$BACKEND_PORT"
+    echo -e "  后端地址: http://localhost:$BACKEND_PORT"
+    echo -e "  前端地址: http://localhost:$fe_port"
+    echo -e "  内网访问: http://$local_ip:$fe_port"
     echo -e "  管理命令: $GLOBAL_CMD"
 }
 
@@ -440,7 +536,7 @@ install_all() {
 menu() {
     clear
     echo -e "${CYAN}############################################################${R}"
-    echo -e "${CYAN}#${R}${GREEN}          KTG-MES 苦糖果MES 管理工具 v3.0 最终版            ${R}${CYAN}#${R}"
+    echo -e "${CYAN}#${R}${GREEN}          KTG-MES 苦糖果MES 管理工具 v3.2 最终版            ${R}${CYAN}#${R}"
     echo -e "${CYAN}############################################################${R}"
     echo ""
     echo -e "  ${YELLOW}[1]${R}  完整安装"
@@ -448,15 +544,17 @@ menu() {
     echo -e "  ${YELLOW}[3]${R}  停止服务"
     echo -e "  ${YELLOW}[4]${R}  查看后端日志"
     echo -e "  ${YELLOW}[5]${R}  卸载"
+    echo -e "  ${YELLOW}[6]${R}  查看运行信息"
     echo -e "  ${YELLOW}[0]${R}  退出"
     echo ""
-    read -p "请输入选项 [0-5]: " opt
+    read -p "请输入选项 [0-6]: " opt
     case "$opt" in
         1) install_all; read -p "按回车返回菜单...";;
         2) start_all; read -p "按回车返回菜单...";;
         3) stop_all; read -p "按回车返回菜单...";;
         4) view_log;;
         5) uninstall_all; read -p "按回车返回菜单...";;
+        6) show_info;;
         0) echo "再见!"; exit 0;;
         *) warn "无效选项"; sleep 1;;
     esac
