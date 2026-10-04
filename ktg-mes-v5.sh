@@ -1164,28 +1164,36 @@ build_frontend() {
         || { [ -f package-lock.json ] && [ package-lock.json -nt node_modules/.ktg-installed ]; }; then
         info "安装前端依赖（npm install --registry=$NPM_MIRROR）..."
         rm -rf node_modules
-        set +e
-        npm install --legacy-peer-deps --no-audit --no-fund \
-            --registry="$NPM_MIRROR" > "$LOG_DIR/npm-install.log" 2>&1
-        local irc=$?
-        if [ "$irc" -ne 0 ]; then
+        if ! npm install --legacy-peer-deps --no-audit --no-fund \
+                --registry="$NPM_MIRROR" > "$LOG_DIR/npm-install.log" 2>&1; then
             warn "首次安装失败，清理缓存后重试一次（国内源偶发超时）"
             npm cache clean --force >/dev/null 2>&1 || true
-            npm install --legacy-peer-deps --no-audit --no-fund \
-                --registry="$NPM_MIRROR" >> "$LOG_DIR/npm-install.log" 2>&1
-            irc=$?
-        fi
-        set -e
-        if [ "$irc" -ne 0 ]; then
-            err "前端依赖安装失败（退出码 $irc），日志末尾："
-            tail -30 "$LOG_DIR/npm-install.log" >&2
-            err "可尝试：npm config set registry $NPM_MIRROR && npm install --legacy-peer-deps"
-            return 1
+            if ! npm install --legacy-peer-deps --no-audit --no-fund \
+                    --registry="$NPM_MIRROR" >> "$LOG_DIR/npm-install.log" 2>&1; then
+                err "前端依赖安装失败，日志末尾："
+                tail -40 "$LOG_DIR/npm-install.log" >&2
+                err "可尝试：npm config set registry $NPM_MIRROR && npm install --legacy-peer-deps"
+                return 1
+            fi
         fi
         touch node_modules/.ktg-installed
         ok "前端依赖安装完成"
     else
         ok "前端依赖已存在且是最新的，跳过安装"
+    fi
+
+    # 关键兼容性修复（原 v4.8 有，v5 曾误删导致编译失败）：
+    # vue-cli 4.4 内置 webpack4，而 package.json 声明的 less@^4 / less-loader@^11 要求 webpack5；
+    # less@4 的 dist/less.js 里用了 `??` 等现代语法，webpack4 的解析器直接报
+    # "Module parse failed: Unexpected token"。必须锁定 webpack4 兼容版本。
+    if [ -d node_modules ]; then
+        if ! npm install --legacy-peer-deps --no-audit --no-fund --registry="$NPM_MIRROR" \
+                less@3.13.1 less-loader@6.2.0 >> "$LOG_DIR/npm-install.log" 2>&1; then
+            err "less/less-loader 回退到 webpack4 兼容版本失败，日志末尾："
+            tail -40 "$LOG_DIR/npm-install.log" >&2
+            return 1
+        fi
+        ok "less/less-loader 已锁定为 webpack4 兼容版本（less@3.13.1 + less-loader@6.2.0）"
     fi
 
     rm -rf dist
@@ -1197,14 +1205,15 @@ build_frontend() {
     if [ "${node_major:-0}" -ge 17 ] 2>/dev/null; then
         node_opts="$node_opts --openssl-legacy-provider"
     fi
-    set +e
-    NODE_OPTIONS="$node_opts" \
-        npm run "$build_script" > "$LOG_DIR/npm-build.log" 2>&1
-    local brc=$?
-    set -e
-    if [ "$brc" -ne 0 ] || [ ! -d dist ]; then
-        err "前端编译失败（退出码 $brc），日志末尾："
-        tail -30 "$LOG_DIR/npm-build.log" >&2
+    # 用 if ! 而不是 set +e/set -e：避免与 ERR 陷阱(set -E)交互导致误报中断
+    if ! NODE_OPTIONS="$node_opts" npm run "$build_script" > "$LOG_DIR/npm-build.log" 2>&1; then
+        err "前端编译失败，日志末尾："
+        tail -40 "$LOG_DIR/npm-build.log" >&2
+        err "请将上面的日志发给我进一步排查"
+        return 1
+    fi
+    if [ ! -d dist ]; then
+        err "编译结束但未生成 dist 目录，请查看：$LOG_DIR/npm-build.log"
         return 1
     fi
     ok "前端编译完成：$FRONTEND_DIR/dist（可交给 nginx 静态托管）"
