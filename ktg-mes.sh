@@ -1,8 +1,7 @@
 #!/bin/bash
 #====================================================================================
-#  KTG-MES 苦糖果 MES 一键部署 & 管理工具 v4.1 终极清理版
-#  用法: sudo bash ktg.sh
-#  新增: [8]一键彻底清理还原 | 全量环境清理 | 数据安全二次确认
+#  KTG-MES 苦糖果 MES 一键部署 & 管理工具 v4.2 智能换源版
+#  新增: Docker镜像源自动切换 | WSL DNS自动修复 | 拉取失败自动重试
 #  修复: MySQL启动误判 | 旧版命令自动清理 | Less编译兼容 | apt锁自动释放
 #====================================================================================
 set -eo pipefail
@@ -29,10 +28,17 @@ GLOBAL_CMD="ktg"
 
 # 国内镜像源
 APT_MIRROR="mirrors.aliyun.com"
-DOCKER_MIRROR="https://mirrors.aliyun.com/docker-ce"
 MAVEN_MIRROR="https://maven.aliyun.com/repository/public"
 NPM_MIRROR="https://registry.npmmirror.com"
 GITEE_OWNER="kutangguo"
+
+# Docker备用镜像源列表（按优先级排序，自动轮询）
+DOCKER_MIRRORS=(
+  "https://docker.mirrors.ustc.edu.cn"
+  "https://registry.cn-hangzhou.aliyuncs.com"
+  "https://hub-mirror.c.163.com"
+  "https://docker.mirrors.ustc.edu.cn"
+)
 
 # Docker配置
 DOCKER_COMPOSE_FILE="$WORK_DIR/docker-compose.yml"
@@ -82,6 +88,97 @@ docker_compose_cmd() {
     fi
 }
 
+# 检测是否为WSL环境
+is_wsl() {
+    grep -qi microsoft /proc/version 2>/dev/null
+}
+
+# 修复WSL DNS解析异常（解决lame referral核心问题）
+fix_wsl_dns() {
+    if ! is_wsl; then
+        return 0
+    fi
+
+    step "修复WSL DNS解析异常"
+    # 备份原配置
+    cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null || true
+
+    # 写入公共DNS
+    tee /etc/resolv.conf > /dev/null << 'EOF'
+nameserver 223.5.5.5
+nameserver 114.114.114.114
+nameserver 8.8.8.8
+EOF
+
+    # 禁止WSL自动覆盖DNS
+    if [ ! -f /etc/wsl.conf ] || ! grep -q "generateResolvConf" /etc/wsl.conf; then
+        tee -a /etc/wsl.conf > /dev/null << 'EOF'
+[network]
+generateResolvConf = false
+EOF
+    fi
+
+    ok "WSL DNS已修复"
+}
+
+# 测试Docker镜像源是否可用
+test_mirror() {
+    local mirror="$1"
+    # 配置临时镜像源
+    mkdir -p /etc/docker
+    cat > /etc/docker/daemon.json << EOF
+{
+  "registry-mirrors": ["$mirror"],
+  "log-driver": "json-file",
+  "log-opts": {"max-size": "100m", "max-file": "3"}
+}
+EOF
+    systemctl daemon-reload
+    systemctl restart docker 2>/dev/null || true
+    sleep 2
+
+    # 测试拉取轻量镜像
+    if docker pull hello-world:latest >/dev/null 2>&1; then
+        docker rmi hello-world:latest >/dev/null 2>&1 || true
+        return 0
+    else
+        return 1
+    fi
+}
+
+# 自动切换可用Docker镜像源
+auto_switch_docker_mirror() {
+    step "自动检测最优Docker镜像源"
+    local success_mirror=""
+
+    for mirror in "${DOCKER_MIRRORS[@]}"; do
+        info "测试镜像源: $mirror"
+        if test_mirror "$mirror"; then
+            success_mirror="$mirror"
+            break
+        else
+            warn "镜像源不可用，切换下一个..."
+        fi
+    done
+
+    if [ -n "$success_mirror" ]; then
+        ok "当前使用镜像源: $success_mirror"
+        return 0
+    else
+        warn "所有备用镜像源均不可用，使用官方源"
+        # 清空镜像源配置
+        cat > /etc/docker/daemon.json << 'EOF'
+{
+  "log-driver": "json-file",
+  "log-opts": {"max-size": "100m", "max-file": "3"}
+}
+EOF
+        systemctl daemon-reload
+        systemctl restart docker 2>/dev/null || true
+        return 1
+    fi
+}
+
 #====================================================================================
 # 1. 系统环境初始化
 #====================================================================================
@@ -93,6 +190,8 @@ env_init() {
     fi
 
     free_apt_lock
+    fix_wsl_dns
+
     info "替换软件源为阿里云镜像"
     sed -i "s/ports.ubuntu.com/$APT_MIRROR/g" /etc/apt/sources.list 2>/dev/null || true
     sed -i "s/security.ubuntu.com/$APT_MIRROR/g" /etc/apt/sources.list 2>/dev/null || true
@@ -139,37 +238,33 @@ EOF
 install_docker() {
     if cmd_exists docker && [ -n "$(docker_compose_cmd)" ]; then
         info "Docker环境已存在"
+        # 已有环境也执行DNS修复和镜像源检测
+        fix_wsl_dns
+        auto_switch_docker_mirror
         return 0
     fi
 
     step "安装Docker环境"
     free_apt_lock
     install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL "$DOCKER_MIRROR/linux/ubuntu/gpg" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
     chmod a+r /etc/apt/keyrings/docker.gpg
 
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] $DOCKER_MIRROR/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
 
     apt update -y
     apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
 
-    # 配置镜像加速
-    mkdir -p /etc/docker
-    cat > /etc/docker/daemon.json << 'EOF'
-{
-  "registry-mirrors": ["https://docker.mirrors.ustc.edu.cn"],
-  "log-driver": "json-file",
-  "log-opts": {"max-size": "100m", "max-file": "3"}
-}
-EOF
-
-    systemctl daemon-reload
-    systemctl restart docker
-    systemctl enable docker
-
     if [ -z "$(docker_compose_cmd)" ]; then
         apt install -y docker-compose
     fi
+
+    systemctl enable docker
+    systemctl start docker
+
+    # 安装完成后自动修复DNS+切换最优镜像源
+    fix_wsl_dns
+    auto_switch_docker_mirror
 
     ok "Docker环境安装完成"
 }
@@ -380,7 +475,7 @@ register_global_cmd() {
 }
 
 install_local() {
-    echo -e "${PURPLE}############ 开始本地模式安装 KTG-MES v4.1 ############${R}"
+    echo -e "${PURPLE}############ 开始本地模式安装 KTG-MES v4.2 ############${R}"
     env_init
     install_docker
     start_db_local
@@ -405,7 +500,7 @@ install_local() {
 }
 
 #====================================================================================
-# 5. Docker全容器化部署模式
+# 5. Docker全容器化部署模式（智能换源版）
 #====================================================================================
 generate_docker_files() {
     step "生成Docker配置文件"
@@ -564,7 +659,7 @@ EOF
 }
 
 deploy_docker() {
-    echo -e "${PURPLE}############ 开始Docker全容器化部署 KTG-MES v4.1 ############${R}"
+    echo -e "${PURPLE}############ 开始Docker全容器化部署 KTG-MES v4.2 ############${R}"
     env_init
     install_docker
     pull_source
@@ -581,7 +676,25 @@ deploy_docker() {
     cd "$WORK_DIR"
     local DC
     DC=$(docker_compose_cmd)
-    $DC up -d --build
+
+    # 第一次构建尝试
+    if $DC up -d --build 2>&1; then
+        build_success=1
+    else
+        build_success=0
+        warn "首次构建失败，自动切换镜像源重试..."
+        # 自动切换下一个镜像源
+        auto_switch_docker_mirror
+        info "使用新镜像源重新构建..."
+        # 清理构建缓存重试
+        $DC build --no-cache 2>&1 && build_success=1 || build_success=0
+    fi
+
+    if [ "$build_success" -eq 0 ]; then
+        err "构建失败，请检查网络或手动执行 docker compose build 查看详情"
+        read -p "按回车继续..."
+        return 1
+    fi
 
     # 等待服务就绪
     info "等待服务启动就绪..."
@@ -622,7 +735,7 @@ deploy_docker() {
 }
 
 #====================================================================================
-# 6. 一键彻底清理还原（核心新增）
+# 6. 一键彻底清理还原
 #====================================================================================
 full_cleanup() {
     clear
@@ -659,7 +772,6 @@ full_cleanup() {
 
     step "删除所有相关Docker容器"
     docker rm -f ktg-mysql ktg-redis ktg-backend ktg-frontend 2>/dev/null || true
-    # 清理compose集群
     if [ -f "$DOCKER_COMPOSE_FILE" ]; then
         local DC
         DC=$(docker_compose_cmd)
@@ -712,15 +824,9 @@ full_cleanup() {
     echo -e "  已删除所有容器"
     echo -e "  已删除项目文件"
     echo -e "  已移除全局命令"
-    if [ "$del_data" == "DELETE" ]; then
-        echo -e "  已清空数据库数据"
-    fi
-    if [ "$del_docker" = "y" ] || [ "$del_docker" = "Y" ]; then
-        echo -e "  已卸载Docker环境"
-    fi
-    if [ "$del_sys" = "y" ] || [ "$del_sys" = "Y" ]; then
-        echo -e "  已卸载系统依赖"
-    fi
+    [ "$del_data" == "DELETE" ] && echo -e "  已清空数据库数据"
+    [ "$del_docker" = "y" ] || [ "$del_docker" = "Y" ] && echo -e "  已卸载Docker环境"
+    [ "$del_sys" = "y" ] || [ "$del_sys" = "Y" ] && echo -e "  已卸载系统依赖"
     echo ""
     echo -e "  环境已还原至部署前状态"
 
@@ -808,7 +914,7 @@ menu() {
     while true; do
         clear
         echo -e "${CYAN}############################################################${R}"
-        echo -e "${CYAN}#${R}${GREEN}          KTG-MES 苦糖果MES 管理工具 v4.1 终极清理版            ${R}${CYAN}#${R}"
+        echo -e "${CYAN}#${R}${GREEN}          KTG-MES 苦糖果MES 管理工具 v4.2 智能换源版            ${R}${CYAN}#${R}"
         echo -e "${CYAN}############################################################${R}"
         echo ""
         echo -e "  ${YELLOW}[1]${R}  本地模式完整安装"
