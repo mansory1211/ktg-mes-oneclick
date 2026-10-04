@@ -1,7 +1,7 @@
 #!/bin/bash
 #====================================================================================
-#  KTG-MES 苦糖果 MES 一键部署 & 管理工具 v4.2 智能换源版
-#  新增: Docker镜像源自动切换 | WSL DNS自动修复 | 拉取失败自动重试
+#  KTG-MES 苦糖果 MES 一键部署 & 管理工具 v4.3 多镜像源增强版
+#  新增: 8个国内镜像源自动轮询 | 镜像检测超时优化 | WSL网络增强
 #  修复: MySQL启动误判 | 旧版命令自动清理 | Less编译兼容 | apt锁自动释放
 #====================================================================================
 set -eo pipefail
@@ -32,12 +32,16 @@ MAVEN_MIRROR="https://maven.aliyun.com/repository/public"
 NPM_MIRROR="https://registry.npmmirror.com"
 GITEE_OWNER="kutangguo"
 
-# Docker备用镜像源列表（按优先级排序，自动轮询）
+# Docker备用镜像源列表（8个，按稳定性优先级排序，自动轮询）
 DOCKER_MIRRORS=(
-  "https://docker.mirrors.ustc.edu.cn"
+  "https://docker.mirrors.sjtug.sjtu.edu.cn"
+  "https://docker.nju.edu.cn"
   "https://registry.cn-hangzhou.aliyuncs.com"
   "https://hub-mirror.c.163.com"
   "https://docker.mirrors.ustc.edu.cn"
+  "https://reg-mirror.qiniu.com"
+  "https://docker.mirrors.huaweicloud.com"
+  "https://mirror.ccs.tencentyun.com"
 )
 
 # Docker配置
@@ -93,24 +97,22 @@ is_wsl() {
     grep -qi microsoft /proc/version 2>/dev/null
 }
 
-# 修复WSL DNS解析异常（解决lame referral核心问题）
+# 修复WSL DNS解析异常
 fix_wsl_dns() {
     if ! is_wsl; then
         return 0
     fi
 
     step "修复WSL DNS解析异常"
-    # 备份原配置
     cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null || true
 
-    # 写入公共DNS
     tee /etc/resolv.conf > /dev/null << 'EOF'
 nameserver 223.5.5.5
 nameserver 114.114.114.114
 nameserver 8.8.8.8
+nameserver 1.1.1.1
 EOF
 
-    # 禁止WSL自动覆盖DNS
     if [ ! -f /etc/wsl.conf ] || ! grep -q "generateResolvConf" /etc/wsl.conf; then
         tee -a /etc/wsl.conf > /dev/null << 'EOF'
 [network]
@@ -121,10 +123,9 @@ EOF
     ok "WSL DNS已修复"
 }
 
-# 测试Docker镜像源是否可用
+# 测试Docker镜像源是否可用（增加15秒超时，避免慢网络误判）
 test_mirror() {
     local mirror="$1"
-    # 配置临时镜像源
     mkdir -p /etc/docker
     cat > /etc/docker/daemon.json << EOF
 {
@@ -137,8 +138,8 @@ EOF
     systemctl restart docker 2>/dev/null || true
     sleep 2
 
-    # 测试拉取轻量镜像
-    if docker pull hello-world:latest >/dev/null 2>&1; then
+    # 超时15秒测试拉取轻量镜像
+    if timeout 15 docker pull hello-world:latest >/dev/null 2>&1; then
         docker rmi hello-world:latest >/dev/null 2>&1 || true
         return 0
     else
@@ -166,7 +167,6 @@ auto_switch_docker_mirror() {
         return 0
     else
         warn "所有备用镜像源均不可用，使用官方源"
-        # 清空镜像源配置
         cat > /etc/docker/daemon.json << 'EOF'
 {
   "log-driver": "json-file",
@@ -238,7 +238,6 @@ EOF
 install_docker() {
     if cmd_exists docker && [ -n "$(docker_compose_cmd)" ]; then
         info "Docker环境已存在"
-        # 已有环境也执行DNS修复和镜像源检测
         fix_wsl_dns
         auto_switch_docker_mirror
         return 0
@@ -262,7 +261,6 @@ install_docker() {
     systemctl enable docker
     systemctl start docker
 
-    # 安装完成后自动修复DNS+切换最优镜像源
     fix_wsl_dns
     auto_switch_docker_mirror
 
@@ -475,7 +473,7 @@ register_global_cmd() {
 }
 
 install_local() {
-    echo -e "${PURPLE}############ 开始本地模式安装 KTG-MES v4.2 ############${R}"
+    echo -e "${PURPLE}############ 开始本地模式安装 KTG-MES v4.3 ############${R}"
     env_init
     install_docker
     start_db_local
@@ -500,7 +498,7 @@ install_local() {
 }
 
 #====================================================================================
-# 5. Docker全容器化部署模式（智能换源版）
+# 5. Docker全容器化部署模式
 #====================================================================================
 generate_docker_files() {
     step "生成Docker配置文件"
@@ -659,12 +657,11 @@ EOF
 }
 
 deploy_docker() {
-    echo -e "${PURPLE}############ 开始Docker全容器化部署 KTG-MES v4.2 ############${R}"
+    echo -e "${PURPLE}############ 开始Docker全容器化部署 KTG-MES v4.3 ############${R}"
     env_init
     install_docker
     pull_source
 
-    # 停止本地服务避免端口冲突
     warn "停止本地服务，避免端口冲突..."
     pkill -f ktg-admin.jar 2>/dev/null || true
     pkill -f "npm run dev" 2>/dev/null || true
@@ -677,16 +674,13 @@ deploy_docker() {
     local DC
     DC=$(docker_compose_cmd)
 
-    # 第一次构建尝试
     if $DC up -d --build 2>&1; then
         build_success=1
     else
         build_success=0
         warn "首次构建失败，自动切换镜像源重试..."
-        # 自动切换下一个镜像源
         auto_switch_docker_mirror
         info "使用新镜像源重新构建..."
-        # 清理构建缓存重试
         $DC build --no-cache 2>&1 && build_success=1 || build_success=0
     fi
 
@@ -696,7 +690,6 @@ deploy_docker() {
         return 1
     fi
 
-    # 等待服务就绪
     info "等待服务启动就绪..."
     sleep 15
 
@@ -779,7 +772,6 @@ full_cleanup() {
     fi
     ok "所有容器已删除"
 
-    # 二次确认：删除数据卷
     echo ""
     read -p "是否删除数据库数据卷？（输入 DELETE 确认永久删除数据）: " del_data
     if [ "$del_data" == "DELETE" ]; then
@@ -799,7 +791,6 @@ full_cleanup() {
     rm -f /usr/local/bin/ktg /usr/local/bin/ktg-mes
     ok "全局命令已移除"
 
-    # 三次确认：卸载系统依赖
     echo ""
     read -p "是否卸载Docker环境？（y/N）: " del_docker
     if [ "$del_docker" = "y" ] || [ "$del_docker" = "Y" ]; then
@@ -914,7 +905,7 @@ menu() {
     while true; do
         clear
         echo -e "${CYAN}############################################################${R}"
-        echo -e "${CYAN}#${R}${GREEN}          KTG-MES 苦糖果MES 管理工具 v4.2 智能换源版            ${R}${CYAN}#${R}"
+        echo -e "${CYAN}#${R}${GREEN}          KTG-MES 苦糖果MES 管理工具 v4.3 多镜像源增强版            ${R}${CYAN}#${R}"
         echo -e "${CYAN}############################################################${R}"
         echo ""
         echo -e "  ${YELLOW}[1]${R}  本地模式完整安装"
