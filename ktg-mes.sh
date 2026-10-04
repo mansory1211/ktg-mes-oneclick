@@ -1,10 +1,11 @@
 #!/bin/bash
 #====================================================================================
-#  KTG-MES 苦糖果 MES 一键部署 & 管理工具 v3.3 全修复稳定版
+#  KTG-MES 苦糖果 MES 一键部署 & 管理工具 v3.4 自动清理版
 #  用法: sudo bash ktg.sh
 #  默认账号: admin / admin123
 #  全局命令: ktg
-#  修复: apt锁/Docker源失败/Maven OOM/Less兼容/前端地址不显示/命令注册失败
+#  新增: 自动清理旧版全局命令，解决版本冲突
+#  修复: apt锁/Docker源失败/Maven OOM/Less兼容/前端地址不显示
 #====================================================================================
 set -eo pipefail
 
@@ -391,10 +392,17 @@ start_frontend() {
 }
 
 #====================================================================================
-# 8. 注册全局命令
+# 8. 注册全局命令（自动清理旧版）
 #====================================================================================
 register_cmd() {
     step "8/9 注册全局管理命令"
+
+    # 自动清理旧版全局命令，彻底解决版本冲突
+    info "清理旧版全局命令残留..."
+    rm -f /usr/local/bin/ktg-mes
+    rm -f /usr/local/bin/ktg
+
+    # 注册新版命令
     local SELF; SELF="$(readlink -f "$0")"
     cp "$SELF" /usr/local/bin/$GLOBAL_CMD
     chmod +x /usr/local/bin/$GLOBAL_CMD
@@ -504,6 +512,7 @@ uninstall_all() {
     docker rm -f "$MYSQL_CONTAINER" "$REDIS_CONTAINER" 2>/dev/null || true
     rm -rf "$WORK_DIR"
     rm -f /usr/local/bin/$GLOBAL_CMD
+    rm -f /usr/local/bin/ktg-mes
     ok "卸载完成"
 }
 
@@ -511,7 +520,7 @@ uninstall_all() {
 # 完整安装流程
 #====================================================================================
 install_all() {
-    echo -e "${PURPLE}############ 开始安装 KTG-MES v3.3 全修复稳定版 ############${R}"
+    echo -e "${PURPLE}############ 开始安装 KTG-MES v3.4 自动清理版 ############${R}"
     env_init
     start_db
     pull_source
@@ -541,7 +550,7 @@ install_all() {
 menu() {
     clear
     echo -e "${CYAN}############################################################${R}"
-    echo -e "${CYAN}#${R}${GREEN}          KTG-MES 苦糖果MES 管理工具 v3.3 最终版            ${R}${CYAN}#${R}"
+    echo -e "${CYAN}#${R}${GREEN}          KTG-MES 苦糖果MES 管理工具 v3.4 自动清理版            ${R}${CYAN}#${R}"
     echo -e "${CYAN}############################################################${R}"
     echo ""
     echo -e "  ${YELLOW}[1]${R}  完整安装"
