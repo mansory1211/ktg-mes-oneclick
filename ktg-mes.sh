@@ -1,7 +1,8 @@
 #!/bin/bash
 #====================================================================================
-#  KTG-MES 苦糖果 MES 一键部署 & 管理工具 v4.3 多镜像源增强版
-#  新增: 8个国内镜像源自动轮询 | 镜像检测超时优化 | WSL网络增强
+#  KTG-MES 苦糖果 MES 一键部署 & 管理工具 v4.4.1 精简镜像源修订版
+#  优化: 精简镜像源列表(仅保留高可用站点) | 减少无效轮询 | 提升部署效率
+#  新增: 网络预检 | WSL网络自动重置 | 官方源重试 | 镜像检测优化
 #  修复: MySQL启动误判 | 旧版命令自动清理 | Less编译兼容 | apt锁自动释放
 #====================================================================================
 set -eo pipefail
@@ -32,16 +33,12 @@ MAVEN_MIRROR="https://maven.aliyun.com/repository/public"
 NPM_MIRROR="https://registry.npmmirror.com"
 GITEE_OWNER="kutangguo"
 
-# Docker备用镜像源列表（8个，按稳定性优先级排序，自动轮询）
+# Docker镜像源列表（仅保留高可用站点，按优先级排序）
 DOCKER_MIRRORS=(
-  "https://docker.mirrors.sjtug.sjtu.edu.cn"
-  "https://docker.nju.edu.cn"
   "https://registry.cn-hangzhou.aliyuncs.com"
-  "https://hub-mirror.c.163.com"
+  "https://registry.cn-beijing.aliyuncs.com"
+  "https://registry.cn-shenzhen.aliyuncs.com"
   "https://docker.mirrors.ustc.edu.cn"
-  "https://reg-mirror.qiniu.com"
-  "https://docker.mirrors.huaweicloud.com"
-  "https://mirror.ccs.tencentyun.com"
 )
 
 # Docker配置
@@ -97,15 +94,28 @@ is_wsl() {
     grep -qi microsoft /proc/version 2>/dev/null
 }
 
-# 修复WSL DNS解析异常
-fix_wsl_dns() {
+# 基础网络预检
+check_basic_network() {
+    step "基础网络连通性预检"
+    if curl -s --connect-timeout 5 https://www.baidu.com >/dev/null 2>&1; then
+        ok "基础网络正常"
+        return 0
+    else
+        warn "基础网络异常，尝试自动修复..."
+        return 1
+    fi
+}
+
+# 深度修复WSL网络
+fix_wsl_network() {
     if ! is_wsl; then
         return 0
     fi
 
-    step "修复WSL DNS解析异常"
-    cp /etc/resolv.conf /etc/resolv.conf.bak 2>/dev/null || true
+    step "深度修复WSL网络"
 
+    # 1. 强制重写DNS
+    info "重置DNS配置..."
     tee /etc/resolv.conf > /dev/null << 'EOF'
 nameserver 223.5.5.5
 nameserver 114.114.114.114
@@ -113,33 +123,54 @@ nameserver 8.8.8.8
 nameserver 1.1.1.1
 EOF
 
-    if [ ! -f /etc/wsl.conf ] || ! grep -q "generateResolvConf" /etc/wsl.conf; then
-        tee -a /etc/wsl.conf > /dev/null << 'EOF'
+    # 2. 配置wsl.conf禁止自动覆盖
+    tee /etc/wsl.conf > /dev/null << 'EOF'
 [network]
 generateResolvConf = false
+[boot]
+systemd=true
 EOF
-    fi
 
-    ok "WSL DNS已修复"
+    # 3. 重启网络相关服务
+    info "重启网络服务..."
+    systemctl restart systemd-resolved 2>/dev/null || true
+    systemctl restart networking 2>/dev/null || true
+    systemctl restart NetworkManager 2>/dev/null || true
+
+    # 4. 清理DNS缓存
+    nscd -i hosts 2>/dev/null || true
+    systemd-resolve --flush-caches 2>/dev/null || true
+
+    sleep 2
+
+    # 5. 再次验证
+    if curl -s --connect-timeout 5 https://www.baidu.com >/dev/null 2>&1; then
+        ok "WSL网络修复成功"
+        return 0
+    else
+        warn "WSL网络修复失败，请检查Windows宿主机代理/防火墙设置"
+        return 1
+    fi
 }
 
-# 测试Docker镜像源是否可用（增加15秒超时，避免慢网络误判）
+# 测试Docker镜像源是否可用
 test_mirror() {
     local mirror="$1"
     mkdir -p /etc/docker
     cat > /etc/docker/daemon.json << EOF
 {
   "registry-mirrors": ["$mirror"],
+  "dns": ["223.5.5.5", "114.114.114.114"],
   "log-driver": "json-file",
   "log-opts": {"max-size": "100m", "max-file": "3"}
 }
 EOF
     systemctl daemon-reload
     systemctl restart docker 2>/dev/null || true
-    sleep 2
+    sleep 3
 
-    # 超时15秒测试拉取轻量镜像
-    if timeout 15 docker pull hello-world:latest >/dev/null 2>&1; then
+    # 超时10秒测试
+    if timeout 10 docker pull hello-world:latest >/dev/null 2>&1; then
         docker rmi hello-world:latest >/dev/null 2>&1 || true
         return 0
     else
@@ -166,9 +197,11 @@ auto_switch_docker_mirror() {
         ok "当前使用镜像源: $success_mirror"
         return 0
     else
-        warn "所有备用镜像源均不可用，使用官方源"
+        warn "所有国内镜像源均不可用，使用官方源（速度较慢）"
+        # 清空镜像源，使用官方源
         cat > /etc/docker/daemon.json << 'EOF'
 {
+  "dns": ["223.5.5.5", "114.114.114.114"],
   "log-driver": "json-file",
   "log-opts": {"max-size": "100m", "max-file": "3"}
 }
@@ -189,9 +222,12 @@ env_init() {
         exit 1
     fi
 
-    free_apt_lock
-    fix_wsl_dns
+    # 网络预检 + 自动修复
+    if ! check_basic_network; then
+        fix_wsl_network || true
+    fi
 
+    free_apt_lock
     info "替换软件源为阿里云镜像"
     sed -i "s/ports.ubuntu.com/$APT_MIRROR/g" /etc/apt/sources.list 2>/dev/null || true
     sed -i "s/security.ubuntu.com/$APT_MIRROR/g" /etc/apt/sources.list 2>/dev/null || true
@@ -238,7 +274,8 @@ EOF
 install_docker() {
     if cmd_exists docker && [ -n "$(docker_compose_cmd)" ]; then
         info "Docker环境已存在"
-        fix_wsl_dns
+        # 已有环境也执行网络检查和镜像源检测
+        check_basic_network || fix_wsl_network || true
         auto_switch_docker_mirror
         return 0
     fi
@@ -261,7 +298,8 @@ install_docker() {
     systemctl enable docker
     systemctl start docker
 
-    fix_wsl_dns
+    # 安装完成后网络检查+镜像切换
+    check_basic_network || fix_wsl_network || true
     auto_switch_docker_mirror
 
     ok "Docker环境安装完成"
@@ -473,7 +511,7 @@ register_global_cmd() {
 }
 
 install_local() {
-    echo -e "${PURPLE}############ 开始本地模式安装 KTG-MES v4.3 ############${R}"
+    echo -e "${PURPLE}############ 开始本地模式安装 KTG-MES v4.4.1 ############${R}"
     env_init
     install_docker
     start_db_local
@@ -657,7 +695,7 @@ EOF
 }
 
 deploy_docker() {
-    echo -e "${PURPLE}############ 开始Docker全容器化部署 KTG-MES v4.3 ############${R}"
+    echo -e "${PURPLE}############ 开始Docker全容器化部署 KTG-MES v4.4.1 ############${R}"
     env_init
     install_docker
     pull_source
@@ -674,6 +712,7 @@ deploy_docker() {
     local DC
     DC=$(docker_compose_cmd)
 
+    # 第一次构建
     if $DC up -d --build 2>&1; then
         build_success=1
     else
@@ -905,7 +944,7 @@ menu() {
     while true; do
         clear
         echo -e "${CYAN}############################################################${R}"
-        echo -e "${CYAN}#${R}${GREEN}          KTG-MES 苦糖果MES 管理工具 v4.3 多镜像源增强版            ${R}${CYAN}#${R}"
+        echo -e "${CYAN}#${R}${GREEN}          KTG-MES 苦糖果MES 管理工具 v4.4.1 精简镜像源版            ${R}${CYAN}#${R}"
         echo -e "${CYAN}############################################################${R}"
         echo ""
         echo -e "  ${YELLOW}[1]${R}  本地模式完整安装"
