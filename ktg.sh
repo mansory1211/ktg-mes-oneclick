@@ -1,9 +1,10 @@
 #!/bin/bash
 #====================================================================================
-#  KTG-MES 苦糖果 MES 一键部署 & 管理工具 v3.2 最终稳定版
-#  用法: sudo bash ktg-mes.sh
+#  KTG-MES 苦糖果 MES 一键部署 & 管理工具 v3.3 全修复稳定版
+#  用法: sudo bash ktg.sh
 #  默认账号: admin / admin123
-#  修复: Docker源失败/apt锁/Maven OOM/前端地址不显示/信息查询 等全部已知问题
+#  全局命令: ktg
+#  修复: apt锁/Docker源失败/Maven OOM/Less兼容/前端地址不显示/命令注册失败
 #====================================================================================
 set -eo pipefail
 
@@ -24,7 +25,7 @@ REDIS_PORT="6379"
 REDIS_PWD="123456"
 
 BACKEND_PORT="8080"
-GLOBAL_CMD="ktg-mes"
+GLOBAL_CMD="ktg"
 
 # 国内镜像源配置
 APT_MIRROR="mirrors.aliyun.com"
@@ -347,7 +348,7 @@ build_backend() {
 }
 
 #====================================================================================
-# 7. 启动前端（自动检测端口+等待就绪）
+# 7. 启动前端（自动兼容Less + 端口检测）
 #====================================================================================
 start_frontend() {
     step "7/9 启动前端服务"
@@ -356,6 +357,10 @@ start_frontend() {
     npm config set registry "$NPM_MIRROR"
     info "安装前端依赖..."
     npm install --legacy-peer-deps 2>&1 | tail -5
+
+    # 安装兼容版本Less，修复Webpack4编译报错
+    info "安装兼容版Less编译器（适配Webpack4）"
+    npm install less@3.13.1 less-loader@6.2.0 --legacy-peer-deps --save-dev 2>/dev/null || true
 
     # 停止旧进程
     pkill -f "npm run dev" 2>/dev/null || true
@@ -397,7 +402,7 @@ register_cmd() {
 }
 
 #====================================================================================
-# 9. 运行信息总览（新增功能）
+# 9. 运行信息总览
 #====================================================================================
 show_info() {
     clear
@@ -506,7 +511,7 @@ uninstall_all() {
 # 完整安装流程
 #====================================================================================
 install_all() {
-    echo -e "${PURPLE}############ 开始安装 KTG-MES v3.2 最终稳定版 ############${R}"
+    echo -e "${PURPLE}############ 开始安装 KTG-MES v3.3 全修复稳定版 ############${R}"
     env_init
     start_db
     pull_source
@@ -536,7 +541,7 @@ install_all() {
 menu() {
     clear
     echo -e "${CYAN}############################################################${R}"
-    echo -e "${CYAN}#${R}${GREEN}          KTG-MES 苦糖果MES 管理工具 v3.2 最终版            ${R}${CYAN}#${R}"
+    echo -e "${CYAN}#${R}${GREEN}          KTG-MES 苦糖果MES 管理工具 v3.3 最终版            ${R}${CYAN}#${R}"
     echo -e "${CYAN}############################################################${R}"
     echo ""
     echo -e "  ${YELLOW}[1]${R}  完整安装"
