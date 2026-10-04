@@ -1,11 +1,10 @@
 #!/bin/bash
 #====================================================================================
-#  KTG-MES 苦糖果 MES 一键部署 & 管理工具 v3.4 自动清理版
+#  KTG-MES 苦糖果 MES 一键部署 & 管理工具 v3.5 稳定修复版
 #  用法: sudo bash ktg.sh
 #  默认账号: admin / admin123
 #  全局命令: ktg
-#  新增: 自动清理旧版全局命令，解决版本冲突
-#  修复: apt锁/Docker源失败/Maven OOM/Less兼容/前端地址不显示
+#  修复: MySQL启动误判bug | 旧版命令自动清理 | Less编译兼容 | apt锁自动释放
 #====================================================================================
 set -eo pipefail
 
@@ -64,19 +63,17 @@ free_apt_lock() {
 
 # 检查命令是否存在
 cmd_exists() {
-    command -v "$1" &>/dev/null
+    command -v "$1" >/dev/null 2>&1
 }
 
 # 自动检测前端端口
 get_frontend_port() {
     sleep 2
-    local port
-    port=$(ss -tlnp | grep "node" | grep -oP ':\K[0-9]+' | head -1)
-    echo "$port"
+    ss -tlnp | grep "node" | grep -oP ':\K[0-9]+' | head -1
 }
 
 #====================================================================================
-# 1. 系统环境初始化（全国内源 + 容错）
+# 1. 系统环境初始化
 #====================================================================================
 env_init() {
     step "1/9 初始化系统运行环境"
@@ -118,7 +115,7 @@ env_init() {
 </settings>
 EOF
 
-    # 安装Docker（阿里云源，避免官方源连接重置）
+    # 安装Docker（阿里云源）
     if ! cmd_exists docker; then
         info "安装Docker（阿里云镜像源）"
         install -m 0755 -d /etc/apt/keyrings
@@ -169,56 +166,76 @@ EOF
 }
 
 #====================================================================================
-# 2. 启动数据库容器
+# 2. 启动数据库容器（修复误判bug版）
 #====================================================================================
 start_db() {
     step "2/9 启动 MySQL + Redis 容器"
 
-    # MySQL
-    if [ -z "$(docker ps -q -f name=^${MYSQL_CONTAINER}$)" ]; then
+    # MySQL 启动
+    if ! docker ps -q --filter "name=^${MYSQL_CONTAINER}$" | grep -q .; then
         docker rm -f "$MYSQL_CONTAINER" 2>/dev/null || true
         docker run -d --name "$MYSQL_CONTAINER" \
             -p ${MYSQL_PORT}:3306 \
             -e MYSQL_ROOT_PASSWORD="$MYSQL_ROOT_PWD" \
             -e MYSQL_DATABASE="$MYSQL_DB" \
             --restart=always "$MYSQL_IMAGE" \
-            --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci \
-            --default-time-zone='+8:00'
+            --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --default-time-zone='+8:00'
         info "MySQL容器已创建，等待启动..."
+    else
+        info "MySQL容器已在运行"
     fi
 
-    # 等待MySQL就绪
+    # ========== 修复：MySQL 健康检查优化 ==========
+    # 1. 循环等待 ping 通（最长120秒）
     for i in $(seq 1 60); do
-        docker exec "$MYSQL_CONTAINER" mysqladmin ping -uroot -p"$MYSQL_ROOT_PWD" --silent &>/dev/null && break
+        if docker exec "$MYSQL_CONTAINER" mysqladmin ping -uroot -p"$MYSQL_ROOT_PWD" --silent >/dev/null 2>&1; then
+            break
+        fi
         sleep 2
     done
-    docker exec "$MYSQL_CONTAINER" mysql -uroot -p"$MYSQL_ROOT_PWD" -e "SELECT 1;" &>/dev/null \
-        || { err "MySQL启动失败"; exit 1; }
 
-    # Redis
-    if [ -z "$(docker ps -q -f name=^${REDIS_CONTAINER}$)" ]; then
+    # 2. 增加3秒就绪缓冲，避免假阳性
+    sleep 3
+
+    # 3. 双重校验：ping + SQL查询
+    if docker exec "$MYSQL_CONTAINER" mysqladmin ping -uroot -p"$MYSQL_ROOT_PWD" --silent >/dev/null 2>&1 \
+        && docker exec "$MYSQL_CONTAINER" mysql -uroot -p"$MYSQL_ROOT_PWD" -e "SELECT 1;" >/dev/null 2>&1; then
+        ok "MySQL 启动成功，端口 $MYSQL_PORT"
+    else
+        err "MySQL启动失败"
+        exit 1
+    fi
+    # ==============================================
+
+    # Redis 启动
+    if ! docker ps -q --filter "name=^${REDIS_CONTAINER}$" | grep -q .; then
         docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
         docker run -d --name "$REDIS_CONTAINER" \
             -p ${REDIS_PORT}:6379 --restart=always "$REDIS_IMAGE" \
             redis-server --requirepass "$REDIS_PWD"
         info "Redis容器已创建"
         sleep 3
+    else
+        info "Redis容器已在运行"
     fi
 
-    docker exec "$REDIS_CONTAINER" redis-cli -a "$REDIS_PWD" ping 2>/dev/null | grep -q PONG \
-        || { err "Redis启动失败"; exit 1; }
+    if docker exec "$REDIS_CONTAINER" redis-cli -a "$REDIS_PWD" ping >/dev/null 2>&1; then
+        ok "Redis 启动成功，端口 $REDIS_PORT"
+    else
+        err "Redis启动失败"
+        exit 1
+    fi
 
-    ok "MySQL + Redis 运行正常"
+    ok "数据库服务运行正常"
 }
 
 #====================================================================================
-# 3. 下载源码（Gitee国内源）
+# 3. 下载源码
 #====================================================================================
 pull_source() {
     step "3/9 下载项目源码"
     mkdir -p "$WORK_DIR" && cd "$WORK_DIR"
 
-    # 后端源码
     if [ ! -d "$BACKEND_DIR" ]; then
         info "下载后端源码..."
         wget -q --show-progress --tries=3 "https://gitee.com/${GITEE_OWNER}/ktg-mes/repository/archive/master.zip" -O /tmp/be.zip
@@ -226,7 +243,6 @@ pull_source() {
         mv /tmp/ktg-mes-master "$BACKEND_DIR"
     fi
 
-    # 前端源码
     if [ ! -d "$FRONTEND_DIR" ]; then
         info "下载前端源码..."
         wget -q --show-progress --tries=3 "https://gitee.com/${GITEE_OWNER}/ktg-mes-ui/repository/archive/master.zip" -O /tmp/fe.zip
@@ -244,7 +260,11 @@ import_db() {
     step "4/9 导入数据库脚本"
     local SQL_FILE
     SQL_FILE=$(find "$BACKEND_DIR/doc" "$BACKEND_DIR/sql" -type f \( -name "*.sql.gz" -o -name "*.sql" \) -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
-    [ -z "$SQL_FILE" ] && { warn "未找到SQL文件，跳过导入"; return 0; }
+
+    if [ -z "$SQL_FILE" ]; then
+        warn "未找到SQL文件，跳过导入"
+        return 0
+    fi
 
     info "使用数据库文件: $SQL_FILE"
     if [[ "$SQL_FILE" == *.gz ]]; then
@@ -257,7 +277,7 @@ import_db() {
 }
 
 #====================================================================================
-# 5. 修改配置（复用原始yml，只替换占位符）
+# 5. 更新项目配置
 #====================================================================================
 patch_config() {
     step "5/9 更新项目配置文件"
@@ -271,7 +291,7 @@ patch_config() {
         cp "$DRUID_CONF" "${DRUID_CONF}.bak"
         sed -i "s|your_username|root|g" "$DRUID_CONF"
         sed -i "s|your_password|$MYSQL_ROOT_PWD|g" "$DRUID_CONF"
-        sed -i "s|jdbc:mysql://[^?]*/[a-zA-Z0-9_-]*|jdbc:mysql://127.0.0.1:${MYSQL_PORT}/${MYSQL_DB}|g" "$DRUID_CONF"
+        sed -i "s|jdbc:mysql://[^:]*:[0-9]*/|jdbc:mysql://127.0.0.1:${MYSQL_PORT}/|g" "$DRUID_CONF"
         ok "数据库连接配置已更新"
     else
         warn "未找到druid配置文件，请检查源码结构"
@@ -280,54 +300,49 @@ patch_config() {
     # 主配置
     if [ -f "$APP_CONF" ]; then
         cp "$APP_CONF" "${APP_CONF}.bak"
-        # 修改服务端口
-        sed -i "/^server:/,/^[a-z]/ s/^\([[:space:]]*port:[[:space:]]*\)[0-9]\+/\1$BACKEND_PORT/" "$APP_CONF"
-        # 修改Redis密码
-        sed -i "/^[[:space:]]*redis:/,/^[a-z]/ s/^\([[:space:]]*password:[[:space:]]*\).*/\1$REDIS_PWD/" "$APP_CONF"
-        # 修改Redis端口
-        sed -i "/^[[:space:]]*redis:/,/^[a-z]/ s/^\([[:space:]]*port:[[:space:]]*\)[0-9]\+/\1$REDIS_PORT/" "$APP_CONF"
-        ok "主配置已更新（端口:$BACKEND_PORT，Redis密码已设置）"
-    else
-        warn "未找到主配置文件，请检查源码结构"
+        sed -i "s|port: [0-9]*|port: $BACKEND_PORT|" "$APP_CONF"
+        ok "后端端口配置已更新为 $BACKEND_PORT"
     fi
 
-    # 前端代理
+    # 前端代理配置
     if [ -f "$VUE_CONF" ]; then
-        sed -i "s|localhost:[0-9]\+|localhost:$BACKEND_PORT|g" "$VUE_CONF"
-        ok "前端代理配置已指向 localhost:$BACKEND_PORT"
+        sed -i "s|localhost:[0-9]*|localhost:$BACKEND_PORT|g" "$VUE_CONF"
+        ok "前端代理配置已更新"
     fi
 }
 
 #====================================================================================
-# 6. 编译后端（内存优化，防OOM）
+# 6. 编译后端
 #====================================================================================
 build_backend() {
     step "6/9 Maven编译后端项目"
 
     # 预检数据库
-    docker exec "$MYSQL_CONTAINER" mysql -uroot -p"$MYSQL_ROOT_PWD" -e "SELECT 1;" "$MYSQL_DB" &>/dev/null \
+    docker exec "$MYSQL_CONTAINER" mysql -uroot -p"$MYSQL_ROOT_PWD" -e "SELECT 1;" >/dev/null 2>&1 \
         || { err "MySQL连接失败"; exit 1; }
-    docker exec "$REDIS_CONTAINER" redis-cli -a "$REDIS_PWD" ping 2>/dev/null | grep -q PONG \
+    docker exec "$REDIS_CONTAINER" redis-cli -a "$REDIS_PWD" ping >/dev/null 2>&1 \
         || { err "Redis连接失败"; exit 1; }
     ok "数据库预检通过"
 
     cd "$BACKEND_DIR"
-    # 设置Maven内存，防止WSL下OOM被杀死
+    # 设置Maven内存，防止OOM
     export MAVEN_OPTS="-Xms512m -Xmx4g"
 
     info "开始编译（首次编译耗时较长，请耐心等待）..."
     mvn clean install -DskipTests -q
 
-    # 查找jar包
     local JAR_FILE
     JAR_FILE=$(find ktg-admin/target -maxdepth 1 -name "*.jar" ! -name "*sources*" ! -name "*original*" | head -1)
-    [ -z "$JAR_FILE" ] && { err "编译失败，未找到jar包"; exit 1; }
+    if [ -z "$JAR_FILE" ]; then
+        err "编译失败，未找到jar包"
+        exit 1
+    fi
 
     # 停止旧进程
     pkill -f ktg-admin.jar 2>/dev/null || true
     sleep 1
 
-    # 启动后端
+    # 后台启动后端
     nohup java -jar "$JAR_FILE" > "$WORK_DIR/backend.log" 2>&1 &
     echo $! > "$WORK_DIR/backend.pid"
     info "后端进程已启动，等待端口就绪..."
@@ -335,21 +350,23 @@ build_backend() {
     # 等待端口
     local ready=0
     for i in $(seq 1 60); do
-        curl -s "http://127.0.0.1:$BACKEND_PORT" >/dev/null 2>&1 && { ready=1; break; }
+        if curl -s "http://127.0.0.1:$BACKEND_PORT" >/dev/null 2>&1; then
+            ready=1
+            break
+        fi
         sleep 2
     done
 
-    if [ "$ready" -ne 1 ]; then
-        err "后端启动失败，最后30行日志："
-        tail -30 "$WORK_DIR/backend.log"
+    if [ "$ready" -eq 1 ]; then
+        ok "后端启动成功，端口 $BACKEND_PORT"
+    else
+        err "后端启动失败，详见日志"
         exit 1
     fi
-
-    ok "后端启动成功，端口 $BACKEND_PORT 就绪"
 }
 
 #====================================================================================
-# 7. 启动前端（自动兼容Less + 端口检测）
+# 7. 启动前端
 #====================================================================================
 start_frontend() {
     step "7/9 启动前端服务"
@@ -359,21 +376,22 @@ start_frontend() {
     info "安装前端依赖..."
     npm install --legacy-peer-deps 2>&1 | tail -5
 
-    # 安装兼容版本Less，修复Webpack4编译报错
+    # 安装兼容版Less，修复Webpack4编译报错
     info "安装兼容版Less编译器（适配Webpack4）"
     npm install less@3.13.1 less-loader@6.2.0 --legacy-peer-deps --save-dev 2>/dev/null || true
 
     # 停止旧进程
     pkill -f "npm run dev" 2>/dev/null || true
+    pkill -f "webpack-dev-server" 2>/dev/null || true
     sleep 1
 
     nohup npm run dev > "$WORK_DIR/frontend.log" 2>&1 &
     echo $! > "$WORK_DIR/frontend.pid"
     info "前端服务启动中，等待端口就绪..."
 
-    # 等待前端端口启动，最多等待60秒
+    # 等待前端端口
     local fe_port=""
-    for i in $(seq 1 30); do
+    for i in $(seq 1 40); do
         fe_port=$(get_frontend_port)
         if [ -n "$fe_port" ]; then
             break
@@ -381,13 +399,13 @@ start_frontend() {
         sleep 2
     done
 
-    if [ -z "$fe_port" ]; then
-        warn "未检测到前端端口，可手动查看日志确认"
+    if [ -n "$fe_port" ]; then
+        ok "前端启动成功，端口 $fe_port"
     else
-        ok "前端启动成功，端口 $fe_port 就绪"
+        warn "未检测到前端端口，可手动查看日志确认"
     fi
 
-    # 保存前端端口到文件，后续查询调用
+    # 保存端口到文件
     echo "$fe_port" > "$WORK_DIR/frontend.port"
 }
 
@@ -397,13 +415,14 @@ start_frontend() {
 register_cmd() {
     step "8/9 注册全局管理命令"
 
-    # 自动清理旧版全局命令，彻底解决版本冲突
+    # 自动清理所有旧版全局命令，彻底解决版本冲突
     info "清理旧版全局命令残留..."
     rm -f /usr/local/bin/ktg-mes
     rm -f /usr/local/bin/ktg
 
     # 注册新版命令
-    local SELF; SELF="$(readlink -f "$0")"
+    local SELF
+    SELF="$(readlink -f "$0")"
     cp "$SELF" /usr/local/bin/$GLOBAL_CMD
     chmod +x /usr/local/bin/$GLOBAL_CMD
     ok "全局命令注册完成，任意目录输入 $GLOBAL_CMD 即可打开管理菜单"
@@ -447,13 +466,13 @@ show_info() {
     echo ""
 
     echo -e "  ${YELLOW}【服务运行状态】${R}"
-    if docker ps -q -f name=^${MYSQL_CONTAINER}$ >/dev/null 2>&1; then
+    if docker ps -q --filter "name=^${MYSQL_CONTAINER}$" | grep -q .; then
         echo -e "  MySQL 容器: ${GREEN}运行中${R}"
     else
         echo -e "  MySQL 容器: ${RED}已停止${R}"
     fi
 
-    if docker ps -q -f name=^${REDIS_CONTAINER}$ >/dev/null 2>&1; then
+    if docker ps -q --filter "name=^${REDIS_CONTAINER}$" | grep -q .; then
         echo -e "  Redis 容器: ${GREEN}运行中${R}"
     else
         echo -e "  Redis 容器: ${RED}已停止${R}"
@@ -465,7 +484,7 @@ show_info() {
         echo -e "  后端服务: ${RED}已停止${R}"
     fi
 
-    if pgrep -f "npm run dev" >/dev/null 2>&1; then
+    if pgrep -f "webpack-dev-server" >/dev/null 2>&1 || pgrep -f "npm run dev" >/dev/null 2>&1; then
         echo -e "  前端服务: ${GREEN}运行中${R}"
     else
         echo -e "  前端服务: ${RED}已停止${R}"
@@ -481,22 +500,27 @@ show_info() {
 start_all() {
     docker start "$MYSQL_CONTAINER" "$REDIS_CONTAINER" 2>/dev/null || true
     cd "$BACKEND_DIR"
-    local JAR_FILE=$(find ktg-admin/target -maxdepth 1 -name "*.jar" ! -name "*sources*" ! -name "*original*" | head -1)
-    nohup java -jar "$JAR_FILE" > "$WORK_DIR/backend.log" 2>&1 &
-    echo $! > "$WORK_DIR/backend.pid"
+    local JAR_FILE
+    JAR_FILE=$(find ktg-admin/target -maxdepth 1 -name "*.jar" ! -name "*sources*" ! -name "*original*" | head -1)
+    if [ -n "$JAR_FILE" ]; then
+        nohup java -jar "$JAR_FILE" > "$WORK_DIR/backend.log" 2>&1 &
+    fi
     cd "$FRONTEND_DIR" && nohup npm run dev > "$WORK_DIR/frontend.log" 2>&1 &
-    echo $! > "$WORK_DIR/frontend.pid"
     ok "全部服务已启动"
 }
 
 stop_all() {
-    [ -f "$WORK_DIR/backend.pid" ]  && kill "$(cat $WORK_DIR/backend.pid)" 2>/dev/null && info "后端已停止"
-    [ -f "$WORK_DIR/frontend.pid" ] && kill "$(cat $WORK_DIR/frontend.pid)" 2>/dev/null && info "前端已停止"
+    [ -f "$WORK_DIR/backend.pid" ] && kill "$(cat "$WORK_DIR/backend.pid")" 2>/dev/null
+    [ -f "$WORK_DIR/frontend.pid" ] && kill "$(cat "$WORK_DIR/frontend.pid")" 2>/dev/null
+    pkill -f ktg-admin.jar 2>/dev/null || true
+    pkill -f "npm run dev" 2>/dev/null || true
+    pkill -f webpack-dev-server 2>/dev/null || true
     read -p "是否同时停止 MySQL/Redis 容器? (y/N): " yn
     if [ "$yn" = "y" ] || [ "$yn" = "Y" ]; then
         docker stop "$MYSQL_CONTAINER" "$REDIS_CONTAINER" 2>/dev/null
         info "数据库容器已停止"
     fi
+    ok "服务已停止"
 }
 
 view_log() {
@@ -506,9 +530,11 @@ view_log() {
 
 uninstall_all() {
     read -p "确认卸载所有KTG-MES相关内容? (y/N): " yn
-    { [ "$yn" != "y" ] && [ "$yn" != "Y" ]; } && { info "已取消"; return; }
+    [ "$yn" != "y" ] && [ "$yn" != "Y" ] && { info "已取消"; return; }
+
     pkill -f ktg-admin.jar 2>/dev/null || true
     pkill -f "npm run dev" 2>/dev/null || true
+    pkill -f webpack-dev-server 2>/dev/null || true
     docker rm -f "$MYSQL_CONTAINER" "$REDIS_CONTAINER" 2>/dev/null || true
     rm -rf "$WORK_DIR"
     rm -f /usr/local/bin/$GLOBAL_CMD
@@ -520,7 +546,7 @@ uninstall_all() {
 # 完整安装流程
 #====================================================================================
 install_all() {
-    echo -e "${PURPLE}############ 开始安装 KTG-MES v3.4 自动清理版 ############${R}"
+    echo -e "${PURPLE}############ 开始安装 KTG-MES v3.5 稳定修复版 ############${R}"
     env_init
     start_db
     pull_source
@@ -548,31 +574,34 @@ install_all() {
 # 主菜单
 #====================================================================================
 menu() {
-    clear
-    echo -e "${CYAN}############################################################${R}"
-    echo -e "${CYAN}#${R}${GREEN}          KTG-MES 苦糖果MES 管理工具 v3.4 自动清理版            ${R}${CYAN}#${R}"
-    echo -e "${CYAN}############################################################${R}"
-    echo ""
-    echo -e "  ${YELLOW}[1]${R}  完整安装"
-    echo -e "  ${YELLOW}[2]${R}  启动服务"
-    echo -e "  ${YELLOW}[3]${R}  停止服务"
-    echo -e "  ${YELLOW}[4]${R}  查看后端日志"
-    echo -e "  ${YELLOW}[5]${R}  卸载"
-    echo -e "  ${YELLOW}[6]${R}  查看运行信息"
-    echo -e "  ${YELLOW}[0]${R}  退出"
-    echo ""
-    read -p "请输入选项 [0-6]: " opt
-    case "$opt" in
-        1) install_all; read -p "按回车返回菜单...";;
-        2) start_all; read -p "按回车返回菜单...";;
-        3) stop_all; read -p "按回车返回菜单...";;
-        4) view_log;;
-        5) uninstall_all; read -p "按回车返回菜单...";;
-        6) show_info;;
-        0) echo "再见!"; exit 0;;
-        *) warn "无效选项"; sleep 1;;
-    esac
+    while true; do
+        clear
+        echo -e "${CYAN}############################################################${R}"
+        echo -e "${CYAN}#${R}${GREEN}          KTG-MES 苦糖果MES 管理工具 v3.5 稳定版            ${R}${CYAN}#${R}"
+        echo -e "${CYAN}############################################################${R}"
+        echo ""
+        echo -e "  ${YELLOW}[1]${R}  完整安装"
+        echo -e "  ${YELLOW}[2]${R}  启动服务"
+        echo -e "  ${YELLOW}[3]${R}  停止服务"
+        echo -e "  ${YELLOW}[4]${R}  查看后端日志"
+        echo -e "  ${YELLOW}[5]${R}  卸载"
+        echo -e "  ${YELLOW}[6]${R}  查看运行信息"
+        echo -e "  ${YELLOW}[0]${R}  退出"
+        echo ""
+        read -p "请输入选项 [0-6]: " opt
+
+        case "$opt" in
+            1) install_all; read -p "按回车继续..." ;;
+            2) start_all; read -p "按回车继续..." ;;
+            3) stop_all; read -p "按回车继续..." ;;
+            4) view_log ;;
+            5) uninstall_all; read -p "按回车继续..." ;;
+            6) show_info ;;
+            0) echo "再见"; exit 0 ;;
+            *) warn "无效选项"; sleep 1 ;;
+        esac
+    done
 }
 
 # 入口
-[ "${1:-}" == "install" ] && install_all || while true; do menu; done
+[ "${1:-}" == "install" ] && install_all || menu
