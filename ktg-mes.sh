@@ -1,8 +1,8 @@
 #!/bin/bash
 #====================================================================================
-#  KTG-MES 苦糖果 MES 一键部署 & 管理工具 v4.4.1 精简镜像源修订版
-#  优化: 精简镜像源列表(仅保留高可用站点) | 减少无效轮询 | 提升部署效率
-#  新增: 网络预检 | WSL网络自动重置 | 官方源重试 | 镜像检测优化
+#  KTG-MES 苦糖果 MES 一键部署 & 管理工具 v4.5 动态换源重试版
+#  优化: 移除前置镜像检测 | 构建失败自动换源重试 | 减少无效等待
+#  新增: 网络预检 | WSL网络自动重置 | 官方源兜底重试
 #  修复: MySQL启动误判 | 旧版命令自动清理 | Less编译兼容 | apt锁自动释放
 #====================================================================================
 set -eo pipefail
@@ -33,7 +33,7 @@ MAVEN_MIRROR="https://maven.aliyun.com/repository/public"
 NPM_MIRROR="https://registry.npmmirror.com"
 GITEE_OWNER="kutangguo"
 
-# Docker镜像源列表（仅保留高可用站点，按优先级排序）
+# Docker镜像源列表（按优先级排序，构建失败自动切换）
 DOCKER_MIRRORS=(
   "https://registry.cn-hangzhou.aliyuncs.com"
   "https://registry.cn-beijing.aliyuncs.com"
@@ -53,7 +53,7 @@ info() { echo -e "${GREEN}[INFO]${R}  $*"; }
 warn() { echo -e "${YELLOW}[WARN]${R}  $*"; }
 err()  { echo -e "${RED}[ERROR]${R}  $*" >&2; }
 step() { echo -e "\n${CYAN}========== $* ==========${R}"; }
-ok()   { echo -e "${GREEN}✔ $*${R}"; }
+ok()   { echo -e "${GREEN}✔ ${R}$*"; }
 
 #====================================================================================
 # 工具函数
@@ -153,8 +153,8 @@ EOF
     fi
 }
 
-# 测试Docker镜像源是否可用
-test_mirror() {
+# 设置指定Docker镜像源
+set_docker_mirror() {
     local mirror="$1"
     mkdir -p /etc/docker
     cat > /etc/docker/daemon.json << EOF
@@ -168,48 +168,21 @@ EOF
     systemctl daemon-reload
     systemctl restart docker 2>/dev/null || true
     sleep 3
-
-    # 超时10秒测试
-    if timeout 10 docker pull hello-world:latest >/dev/null 2>&1; then
-        docker rmi hello-world:latest >/dev/null 2>&1 || true
-        return 0
-    else
-        return 1
-    fi
 }
 
-# 自动切换可用Docker镜像源
-auto_switch_docker_mirror() {
-    step "自动检测最优Docker镜像源"
-    local success_mirror=""
-
-    for mirror in "${DOCKER_MIRRORS[@]}"; do
-        info "测试镜像源: $mirror"
-        if test_mirror "$mirror"; then
-            success_mirror="$mirror"
-            break
-        else
-            warn "镜像源不可用，切换下一个..."
-        fi
-    done
-
-    if [ -n "$success_mirror" ]; then
-        ok "当前使用镜像源: $success_mirror"
-        return 0
-    else
-        warn "所有国内镜像源均不可用，使用官方源（速度较慢）"
-        # 清空镜像源，使用官方源
-        cat > /etc/docker/daemon.json << 'EOF'
+# 切换为官方源（无镜像）
+set_docker_official() {
+    mkdir -p /etc/docker
+    cat > /etc/docker/daemon.json << 'EOF'
 {
   "dns": ["223.5.5.5", "114.114.114.114"],
   "log-driver": "json-file",
   "log-opts": {"max-size": "100m", "max-file": "3"}
 }
 EOF
-        systemctl daemon-reload
-        systemctl restart docker 2>/dev/null || true
-        return 1
-    fi
+    systemctl daemon-reload
+    systemctl restart docker 2>/dev/null || true
+    sleep 3
 }
 
 #====================================================================================
@@ -274,9 +247,8 @@ EOF
 install_docker() {
     if cmd_exists docker && [ -n "$(docker_compose_cmd)" ]; then
         info "Docker环境已存在"
-        # 已有环境也执行网络检查和镜像源检测
-        check_basic_network || fix_wsl_network || true
-        auto_switch_docker_mirror
+        # 默认配置第一个镜像源，不做预检测
+        set_docker_mirror "${DOCKER_MIRRORS[0]}"
         return 0
     fi
 
@@ -298,9 +270,8 @@ install_docker() {
     systemctl enable docker
     systemctl start docker
 
-    # 安装完成后网络检查+镜像切换
-    check_basic_network || fix_wsl_network || true
-    auto_switch_docker_mirror
+    # 默认配置第一个镜像源
+    set_docker_mirror "${DOCKER_MIRRORS[0]}"
 
     ok "Docker环境安装完成"
 }
@@ -511,7 +482,7 @@ register_global_cmd() {
 }
 
 install_local() {
-    echo -e "${PURPLE}############ 开始本地模式安装 KTG-MES v4.4.1 ############${R}"
+    echo -e "${PURPLE}############ 开始本地模式安装 KTG-MES v4.5 ############${R}"
     env_init
     install_docker
     start_db_local
@@ -536,7 +507,7 @@ install_local() {
 }
 
 #====================================================================================
-# 5. Docker全容器化部署模式
+# 5. Docker全容器化部署模式（动态换源重试）
 #====================================================================================
 generate_docker_files() {
     step "生成Docker配置文件"
@@ -695,7 +666,7 @@ EOF
 }
 
 deploy_docker() {
-    echo -e "${PURPLE}############ 开始Docker全容器化部署 KTG-MES v4.4.1 ############${R}"
+    echo -e "${PURPLE}############ 开始Docker全容器化部署 KTG-MES v4.5 ############${R}"
     env_init
     install_docker
     pull_source
@@ -711,16 +682,39 @@ deploy_docker() {
     cd "$WORK_DIR"
     local DC
     DC=$(docker_compose_cmd)
+    local build_success=0
+    local mirror_count=${#DOCKER_MIRRORS[@]}
 
-    # 第一次构建
-    if $DC up -d --build 2>&1; then
-        build_success=1
-    else
-        build_success=0
-        warn "首次构建失败，自动切换镜像源重试..."
-        auto_switch_docker_mirror
-        info "使用新镜像源重新构建..."
-        $DC build --no-cache 2>&1 && build_success=1 || build_success=0
+    # 循环尝试每个镜像源
+    for ((i=0; i<mirror_count; i++)); do
+        local mirror="${DOCKER_MIRRORS[$i]}"
+        info "使用镜像源 [$((i+1))/$mirror_count]: $mirror"
+        set_docker_mirror "$mirror"
+
+        if [ $i -eq 0 ]; then
+            # 第一次用正常构建
+            if $DC up -d --build 2>&1; then
+                build_success=1
+                break
+            fi
+        else
+            # 重试时清理缓存
+            warn "上一个镜像源构建失败，切换镜像源并重试..."
+            if $DC build --no-cache 2>&1 && $DC up -d 2>&1; then
+                build_success=1
+                break
+            fi
+        fi
+    done
+
+    # 所有国内源失败，尝试官方源兜底
+    if [ "$build_success" -eq 0 ]; then
+        warn "所有国内镜像源均失败，使用官方源兜底重试..."
+        set_docker_official
+        if $DC build --no-cache 2>&1 && $DC up -d 2>&1; then
+            build_success=1
+            ok "官方源构建成功"
+        fi
     fi
 
     if [ "$build_success" -eq 0 ]; then
@@ -944,7 +938,7 @@ menu() {
     while true; do
         clear
         echo -e "${CYAN}############################################################${R}"
-        echo -e "${CYAN}#${R}${GREEN}          KTG-MES 苦糖果MES 管理工具 v4.4.1 精简镜像源版            ${R}${CYAN}#${R}"
+        echo -e "${CYAN}#${R}${GREEN}          KTG-MES 苦糖果MES 管理工具 v4.5 动态换源版            ${R}${CYAN}#${R}"
         echo -e "${CYAN}############################################################${R}"
         echo ""
         echo -e "  ${YELLOW}[1]${R}  本地模式完整安装"
