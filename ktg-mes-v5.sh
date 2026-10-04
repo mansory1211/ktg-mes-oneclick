@@ -113,10 +113,10 @@ FRONTEND_PID_FILE="$WORK_DIR/frontend.pid"
 
 # ======================= 输出函数 =======================
 _c() { printf '\033[%sm%s\033[0m\n' "$1" "$2"; }
-info() { _c '32;[INFO] ' "$*"; }
-warn() { _c '33;[WARN] ' "$*"; }
-err()  { _c '31;[ERROR]' "$*" >&2; }
-ok()   { _c '32;✔ ' "$*"; }
+info() { _c '32' "[INFO]  $*"; }
+warn() { _c '33' "[WARN]  $*"; }
+err()  { _c '31' "[ERROR] $*" >&2; }
+ok()   { _c '32' "✔  $*"; }
 step() { printf '\n\033[36m===== %s =====\033[0m\n' "$*"; }
 
 on_error() {
@@ -454,7 +454,15 @@ wait_for_port() {
 # ======================= 全局命令注册 =======================
 register_global_cmd() {
     local src dst="/usr/local/bin/$GLOBAL_CMD"
-    src="$(readlink -f "$0")"
+    # 关键：BASH_SOURCE[0] 比 $0 可靠。
+    # 当以 `bash -s < 文件`、`curl | bash` 或 stdin 方式运行时，$0 会变成 "bash"，
+    # 此时 readlink -f "bash" 会解析成 /root/bash 这种不存在的路径导致 cp 失败。
+    src="${BASH_SOURCE[0]:-$0}"
+    src="$(readlink -f "$src" 2>/dev/null || true)"
+    if [ -z "$src" ] || [ ! -f "$src" ]; then
+        warn "无法定位脚本文件（当前 \$0=$0），跳过全局命令注册"
+        return 0
+    fi
     mkdir -p /usr/local/bin
     if [ "$(readlink -f "$dst" 2>/dev/null || true)" = "$src" ]; then
         return 0
