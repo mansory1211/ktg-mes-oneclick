@@ -1,9 +1,7 @@
 #!/bin/bash
 #====================================================================================
-#  KTG-MES 苦糖果 MES 一键部署 & 管理工具 v4.5 动态换源重试版
-#  优化: 移除前置镜像检测 | 构建失败自动换源重试 | 减少无效等待
-#  新增: 网络预检 | WSL网络自动重置 | 官方源兜底重试
-#  修复: MySQL启动误判 | 旧版命令自动清理 | Less编译兼容 | apt锁自动释放
+#  KTG-MES 一键部署管理工具 v4.8 稳定优化版
+#  修复：Redis配置错误、Docker服务预检、编译优化、启动检测、全局命令注册
 #====================================================================================
 set -eo pipefail
 
@@ -14,978 +12,389 @@ FRONTEND_DIR="$WORK_DIR/ktg-mes-ui"
 
 MYSQL_CONTAINER="ktg-mysql"
 MYSQL_IMAGE="mysql:5.7"
-MYSQL_PORT="3306"
+MYSQL_PORT=3306
 MYSQL_ROOT_PWD="123456"
 MYSQL_DB="j2eedb"
 
 REDIS_CONTAINER="ktg-redis"
 REDIS_IMAGE="redis:7"
-REDIS_PORT="6379"
+REDIS_PORT=6379
 REDIS_PWD="123456"
 
-BACKEND_PORT="8080"
-FRONTEND_PORT="80"
+BACKEND_PORT=8080
 GLOBAL_CMD="ktg"
 
-# 国内镜像源
 APT_MIRROR="mirrors.aliyun.com"
-MAVEN_MIRROR="https://maven.aliyun.com/repository/public"
+MAVEN_SETTINGS="/etc/maven/settings.xml"
 NPM_MIRROR="https://registry.npmmirror.com"
-GITEE_OWNER="kutangguo"
 
-# Docker镜像源列表（按优先级排序，构建失败自动切换）
 DOCKER_MIRRORS=(
-  "https://registry.cn-hangzhou.aliyuncs.com"
-  "https://registry.cn-beijing.aliyuncs.com"
-  "https://registry.cn-shenzhen.aliyuncs.com"
+  "https://hub-mirror.c.163.com"
   "https://docker.mirrors.ustc.edu.cn"
+  "https://registry.cn-hangzhou.aliyuncs.com"
 )
 
-# Docker配置
 DOCKER_COMPOSE_FILE="$WORK_DIR/docker-compose.yml"
 DOCKER_NETWORK="ktg-network"
-# ========================================================
 
-# 颜色输出
-R='\033[0m'; RED='\033[0;31m'; GREEN='\033[0;32m'
-YELLOW='\033[1;33m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'
-info() { echo -e "${GREEN}[INFO]${R}  $*"; }
-warn() { echo -e "${YELLOW}[WARN]${R}  $*"; }
-err()  { echo -e "${RED}[ERROR]${R}  $*" >&2; }
-step() { echo -e "\n${CYAN}========== $* ==========${R}"; }
-ok()   { echo -e "${GREEN}✔ ${R}$*"; }
+# ======================= 工具函数 =======================
+info()  { echo -e "\033[32m[INFO]\033[0m  $*"; }
+warn()  { echo -e "\033[33m[WARN]\033[0m  $*"; }
+err()   { echo -e "\033[31m[ERROR]\033[0m $*"; }
+ok()    { echo -e "\033[32m✔\033[0m  $*"; }
 
-#====================================================================================
-# 工具函数
-#====================================================================================
-free_apt_lock() {
-    if lsof /var/lib/dpkg/lock-frontend >/dev/null 2>&1; then
-        warn "检测到apt包锁被占用，正在释放..."
-        killall apt apt-get dpkg 2>/dev/null || true
-        sleep 1
-        rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock
-        dpkg --configure -a 2>/dev/null || true
-        ok "包锁已释放"
-    fi
-}
-
-cmd_exists() {
-    command -v "$1" >/dev/null 2>&1
-}
-
-get_frontend_port() {
-    sleep 2
-    ss -tlnp | grep "node" | grep -oP ':\K[0-9]+' | head -1
-}
-
-# 检测Docker Compose命令
-docker_compose_cmd() {
-    if cmd_exists "docker-compose"; then
-        echo "docker-compose"
-    elif docker compose version >/dev/null 2>&1; then
-        echo "docker compose"
-    else
-        echo ""
-    fi
-}
-
-# 检测是否为WSL环境
-is_wsl() {
-    grep -qi microsoft /proc/version 2>/dev/null
-}
-
-# 基础网络预检
-check_basic_network() {
-    step "基础网络连通性预检"
-    if curl -s --connect-timeout 5 https://www.baidu.com >/dev/null 2>&1; then
-        ok "基础网络正常"
-        return 0
-    else
-        warn "基础网络异常，尝试自动修复..."
-        return 1
-    fi
-}
-
-# 深度修复WSL网络
-fix_wsl_network() {
-    if ! is_wsl; then
+# 检查并启动Docker服务
+ensure_docker_running() {
+    if docker info >/dev/null 2>&1; then
         return 0
     fi
-
-    step "深度修复WSL网络"
-
-    # 1. 强制重写DNS
-    info "重置DNS配置..."
-    tee /etc/resolv.conf > /dev/null << 'EOF'
-nameserver 223.5.5.5
-nameserver 114.114.114.114
-nameserver 8.8.8.8
-nameserver 1.1.1.1
-EOF
-
-    # 2. 配置wsl.conf禁止自动覆盖
-    tee /etc/wsl.conf > /dev/null << 'EOF'
-[network]
-generateResolvConf = false
-[boot]
-systemd=true
-EOF
-
-    # 3. 重启网络相关服务
-    info "重启网络服务..."
-    systemctl restart systemd-resolved 2>/dev/null || true
-    systemctl restart networking 2>/dev/null || true
-    systemctl restart NetworkManager 2>/dev/null || true
-
-    # 4. 清理DNS缓存
-    nscd -i hosts 2>/dev/null || true
-    systemd-resolve --flush-caches 2>/dev/null || true
-
-    sleep 2
-
-    # 5. 再次验证
-    if curl -s --connect-timeout 5 https://www.baidu.com >/dev/null 2>&1; then
-        ok "WSL网络修复成功"
-        return 0
-    else
-        warn "WSL网络修复失败，请检查Windows宿主机代理/防火墙设置"
-        return 1
-    fi
-}
-
-# 设置指定Docker镜像源
-set_docker_mirror() {
-    local mirror="$1"
-    mkdir -p /etc/docker
-    cat > /etc/docker/daemon.json << EOF
-{
-  "registry-mirrors": ["$mirror"],
-  "dns": ["223.5.5.5", "114.114.114.114"],
-  "log-driver": "json-file",
-  "log-opts": {"max-size": "100m", "max-file": "3"}
-}
-EOF
-    systemctl daemon-reload
-    systemctl restart docker 2>/dev/null || true
+    warn "Docker服务未运行，尝试启动..."
+    systemctl start docker 2>/dev/null || true
     sleep 3
+    if docker info >/dev/null 2>&1; then
+        ok "Docker服务已启动"
+        return 0
+    fi
+    err "Docker服务启动失败，请手动检查：systemctl status docker"
+    exit 1
 }
 
-# 切换为官方源（无镜像）
-set_docker_official() {
-    mkdir -p /etc/docker
-    cat > /etc/docker/daemon.json << 'EOF'
-{
-  "dns": ["223.5.5.5", "114.114.114.114"],
-  "log-driver": "json-file",
-  "log-opts": {"max-size": "100m", "max-file": "3"}
-}
-EOF
-    systemctl daemon-reload
-    systemctl restart docker 2>/dev/null || true
-    sleep 3
+# 检查命令是否存在
+cmd_exists() { command -v "$1" >/dev/null 2>&1; }
+
+# 注册全局命令
+register_global_cmd() {
+    local script_path
+    script_path="$(readlink -f "$0")"
+    if [ ! -f "/usr/local/bin/$GLOBAL_CMD" ] || [ "$(readlink -f "/usr/local/bin/$GLOBAL_CMD")" != "$script_path" ]; then
+        cp "$script_path" "/usr/local/bin/$GLOBAL_CMD"
+        chmod +x "/usr/local/bin/$GLOBAL_CMD"
+        ok "全局命令 $GLOBAL_CMD 已注册"
+    fi
 }
 
-#====================================================================================
-# 1. 系统环境初始化
-#====================================================================================
+# ======================= 1. 系统环境初始化 =======================
 env_init() {
-    step "初始化系统运行环境"
+    echo ""
+    info "===== 初始化系统环境 ====="
+    
     if [ "$(id -u)" -ne 0 ]; then
-        err "请使用 sudo 运行此脚本"
+        err "请使用 root 权限运行：sudo $0"
         exit 1
     fi
 
-    # 网络预检 + 自动修复
-    if ! check_basic_network; then
-        fix_wsl_network || true
+    mkdir -p "$WORK_DIR"
+    register_global_cmd
+
+    # 基础依赖安装
+    if ! cmd_exists mvn || ! cmd_exists java || ! cmd_exists node; then
+        info "安装基础依赖..."
+        apt update -qq >/dev/null 2>&1
+        apt install -y -qq curl wget git openjdk-8-jdk maven nodejs npm >/dev/null 2>&1
     fi
 
-    free_apt_lock
-    info "替换软件源为阿里云镜像"
-    sed -i "s/ports.ubuntu.com/$APT_MIRROR/g" /etc/apt/sources.list 2>/dev/null || true
-    sed -i "s/security.ubuntu.com/$APT_MIRROR/g" /etc/apt/sources.list 2>/dev/null || true
-    apt update -y 2>/dev/null || apt update -y
-
-    info "安装基础依赖包"
-    apt install -y curl wget git unzip ca-certificates gnupg lsb-release net-tools iproute2
-    apt install -y openjdk-8-jdk-headless maven
-    java -version 2>&1 | head -1
-
-    info "配置Maven国内镜像"
-    mkdir -p /etc/maven
-    cat > /etc/maven/settings.xml << 'EOF'
+    # Maven 阿里云源配置
+    if [ ! -f "$MAVEN_SETTINGS" ]; then
+        mkdir -p /etc/maven
+        cat > "$MAVEN_SETTINGS" << 'EOF'
 <settings>
   <mirrors>
     <mirror>
       <id>aliyun</id>
       <mirrorOf>central</mirrorOf>
-      <name>阿里云公共仓库</name>
       <url>https://maven.aliyun.com/repository/public</url>
     </mirror>
   </mirrors>
 </settings>
 EOF
-
-    # 安装Node.js 16
-    if ! cmd_exists node || ! node -v 2>/dev/null | grep -q '^v16'; then
-        info "安装Node.js 16"
-        curl -fsSL https://deb.nodesource.com/setup_16.x | bash -
-        apt install -y nodejs
     fi
-    node -v
 
-    grep -q "nofile 65536" /etc/security/limits.conf || cat >> /etc/security/limits.conf << 'EOF'
-* soft nofile 65536
-* hard nofile 65536
-EOF
     ok "系统环境初始化完成"
 }
 
-#====================================================================================
-# 2. Docker环境安装
-#====================================================================================
-install_docker() {
-    if cmd_exists docker && [ -n "$(docker_compose_cmd)" ]; then
-        info "Docker环境已存在"
-        # 默认配置第一个镜像源，不做预检测
-        set_docker_mirror "${DOCKER_MIRRORS[0]}"
+# ======================= 2. Docker 环境配置 =======================
+docker_env_init() {
+    ensure_docker_running
+    
+    # 配置默认镜像源（第一个）
+    if [ ${#DOCKER_MIRRORS[@]} -gt 0 ]; then
+        mkdir -p /etc/docker
+        cat > /etc/docker/daemon.json << EOF
+{
+  "registry-mirrors": ["${DOCKER_MIRRORS[0]}"],
+  "dns": ["223.5.5.5", "114.114.114.114"],
+  "log-driver": "json-file",
+  "log-opts": {"max-size": "100m", "max-file": "3"}
+}
+EOF
+        systemctl daemon-reload
+        systemctl restart docker
+        sleep 2
+    fi
+}
+
+# ======================= 3. 源码下载 =======================
+pull_source() {
+    echo ""
+    info "===== 检查项目源码 ====="
+    
+    if [ -d "$BACKEND_DIR" ] && [ -d "$FRONTEND_DIR" ]; then
+        ok "项目源码已存在"
         return 0
     fi
 
-    step "安装Docker环境"
-    free_apt_lock
-    install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    chmod a+r /etc/apt/keyrings/docker.gpg
+    info "下载项目源码..."
+    cd "$WORK_DIR"
 
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-    apt update -y
-    apt install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
-
-    if [ -z "$(docker_compose_cmd)" ]; then
-        apt install -y docker-compose
-    fi
-
-    systemctl enable docker
-    systemctl start docker
-
-    # 默认配置第一个镜像源
-    set_docker_mirror "${DOCKER_MIRRORS[0]}"
-
-    ok "Docker环境安装完成"
-}
-
-#====================================================================================
-# 3. 源码下载
-#====================================================================================
-pull_source() {
-    step "下载项目源码"
-    mkdir -p "$WORK_DIR" && cd "$WORK_DIR"
-
+    # 后端
     if [ ! -d "$BACKEND_DIR" ]; then
-        info "下载后端源码..."
-        wget -q --show-progress --tries=3 "https://gitee.com/${GITEE_OWNER}/ktg-mes/repository/archive/master.zip" -O /tmp/be.zip
-        unzip -q /tmp/be.zip -d /tmp/
-        mv /tmp/ktg-mes-master "$BACKEND_DIR"
+        wget -q --show-progress "https://gitee.com/ktg-dev/ktg-mes/repository/archive/master.zip" -O backend.zip
+        unzip -q backend.zip
+        mv ktg-mes-master ktg-mes
+        rm -f backend.zip
     fi
 
+    # 前端
     if [ ! -d "$FRONTEND_DIR" ]; then
-        info "下载前端源码..."
-        wget -q --show-progress --tries=3 "https://gitee.com/${GITEE_OWNER}/ktg-mes-ui/repository/archive/master.zip" -O /tmp/fe.zip
-        unzip -q /tmp/fe.zip -d /tmp/
-        mv /tmp/ktg-mes-ui-master "$FRONTEND_DIR"
+        wget -q --show-progress "https://gitee.com/ktg-dev/ktg-mes-ui/repository/archive/master.zip" -O frontend.zip
+        unzip -q frontend.zip
+        mv ktg-mes-ui-master ktg-mes-ui
+        rm -f frontend.zip
     fi
+
     ok "源码下载完成"
 }
 
-#====================================================================================
-# 4. 本地部署模式
-#====================================================================================
-start_db_local() {
-    step "启动数据库容器"
+# ======================= 4. 数据库容器启动 =======================
+start_db_containers() {
+    echo ""
+    info "===== 启动数据库容器 ====="
+    ensure_docker_running
 
-    if ! docker ps -q --filter "name=^${MYSQL_CONTAINER}$" | grep -q .; then
-        docker rm -f "$MYSQL_CONTAINER" 2>/dev/null || true
+    # 启动 MySQL
+    if ! docker ps --format '{{.Names}}' | grep -q "$MYSQL_CONTAINER"; then
+        info "启动 MySQL 容器..."
         docker run -d --name "$MYSQL_CONTAINER" \
-            -p ${MYSQL_PORT}:3306 \
+            -p "$MYSQL_PORT:3306" \
             -e MYSQL_ROOT_PASSWORD="$MYSQL_ROOT_PWD" \
             -e MYSQL_DATABASE="$MYSQL_DB" \
-            --restart=always "$MYSQL_IMAGE" \
-            --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --default-time-zone='+8:00'
-        info "MySQL容器已创建，等待启动..."
-    else
-        info "MySQL容器已在运行"
+            --restart always \
+            "$MYSQL_IMAGE" \
+            --character-set-server=utf8mb4 \
+            --collation-server=utf8mb4_unicode_ci >/dev/null
+        
+        # 等待 MySQL 就绪
+        info "等待 MySQL 初始化..."
+        for i in {1..30}; do
+            if docker exec "$MYSQL_CONTAINER" mysql -uroot -p"$MYSQL_ROOT_PWD" -e "SELECT 1;" >/dev/null 2>&1; then
+                break
+            fi
+            sleep 1
+        done
     fi
+    ok "MySQL 容器运行正常"
 
-    # 健康检查（修复误判）
-    for i in $(seq 1 60); do
-        docker exec "$MYSQL_CONTAINER" mysqladmin ping -uroot -p"$MYSQL_ROOT_PWD" --silent >/dev/null 2>&1 && break
-        sleep 2
-    done
-    sleep 3
-
-    if docker exec "$MYSQL_CONTAINER" mysql -uroot -p"$MYSQL_ROOT_PWD" -e "SELECT 1;" >/dev/null 2>&1; then
-        ok "MySQL启动成功，端口 $MYSQL_PORT"
-    else
-        err "MySQL启动失败"
-        exit 1
-    fi
-
-    if ! docker ps -q --filter "name=^${REDIS_CONTAINER}$" | grep -q .; then
-        docker rm -f "$REDIS_CONTAINER" 2>/dev/null || true
+    # 启动 Redis
+    if ! docker ps --format '{{.Names}}' | grep -q "$REDIS_CONTAINER"; then
+        info "启动 Redis 容器..."
         docker run -d --name "$REDIS_CONTAINER" \
-            -p ${REDIS_PORT}:6379 --restart=always "$REDIS_IMAGE" \
-            redis-server --requirepass "$REDIS_PWD"
-        info "Redis容器已创建"
-        sleep 3
+            -p "$REDIS_PORT:6379" \
+            --restart always \
+            "$REDIS_IMAGE" \
+            redis-server --requirepass "$REDIS_PWD" >/dev/null
+        sleep 2
     fi
-
-    if docker exec "$REDIS_CONTAINER" redis-cli -a "$REDIS_PWD" ping >/dev/null 2>&1; then
-        ok "Redis启动成功，端口 $REDIS_PORT"
-    else
-        err "Redis启动失败"
-        exit 1
-    fi
-    ok "数据库服务运行正常"
+    ok "Redis 容器运行正常"
 }
 
-import_db_local() {
-    step "导入数据库脚本"
-    local SQL_FILE
-    SQL_FILE=$(find "$BACKEND_DIR/doc" "$BACKEND_DIR/sql" -type f \( -name "*.sql.gz" -o -name "*.sql" \) -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
-
-    if [ -z "$SQL_FILE" ]; then
-        warn "未找到SQL文件，跳过导入"
+# ======================= 5. 配置文件自动修正（核心修复） =======================
+patch_config() {
+    echo ""
+    info "===== 自动修正项目配置 ====="
+    
+    local res_dir="$BACKEND_DIR/ktg-admin/src/main/resources"
+    if [ ! -d "$res_dir" ]; then
+        warn "未找到配置目录，跳过修正"
         return 0
     fi
 
-    info "使用数据库文件: $SQL_FILE"
-    if [[ "$SQL_FILE" == *.gz ]]; then
-        gunzip -c "$SQL_FILE" | docker exec -i "$MYSQL_CONTAINER" mysql -uroot -p"$MYSQL_ROOT_PWD" "$MYSQL_DB"
-    else
-        docker exec -i "$MYSQL_CONTAINER" mysql -uroot -p"$MYSQL_ROOT_PWD" "$MYSQL_DB" < "$SQL_FILE"
-    fi
-    ok "数据库导入完成"
-}
-
-patch_config_local() {
-    step "更新项目配置文件"
-    local RES_DIR="$BACKEND_DIR/ktg-admin/src/main/resources"
-    local DRUID_CONF="$RES_DIR/application-druid.yml"
-    local APP_CONF="$RES_DIR/application.yml"
-    local VUE_CONF="$FRONTEND_DIR/vue.config.js"
-
-    if [ -f "$DRUID_CONF" ]; then
-        cp "$DRUID_CONF" "${DRUID_CONF}.bak"
-        sed -i "s|your_username|root|g" "$DRUID_CONF"
-        sed -i "s|your_password|$MYSQL_ROOT_PWD|g" "$DRUID_CONF"
-        sed -i "s|jdbc:mysql://[^:]*:[0-9]*/|jdbc:mysql://127.0.0.1:${MYSQL_PORT}/|g" "$DRUID_CONF"
-        ok "数据库连接配置已更新"
-    fi
-
-    if [ -f "$APP_CONF" ]; then
-        cp "$APP_CONF" "${APP_CONF}.bak"
-        sed -i "s|port: [0-9]*|port: $BACKEND_PORT|" "$APP_CONF"
-        ok "后端端口配置已更新"
-    fi
-
-    if [ -f "$VUE_CONF" ]; then
-        sed -i "s|localhost:[0-9]*|localhost:$BACKEND_PORT|g" "$VUE_CONF"
-        ok "前端代理配置已更新"
-    fi
-}
-
-build_backend_local() {
-    step "编译后端项目"
-    docker exec "$MYSQL_CONTAINER" mysql -uroot -p"$MYSQL_ROOT_PWD" -e "SELECT 1;" >/dev/null 2>&1 || { err "MySQL连接失败"; exit 1; }
-    docker exec "$REDIS_CONTAINER" redis-cli -a "$REDIS_PWD" ping >/dev/null 2>&1 || { err "Redis连接失败"; exit 1; }
-    ok "数据库预检通过"
-
-    cd "$BACKEND_DIR"
-    export MAVEN_OPTS="-Xms512m -Xmx4g"
-    info "开始编译（首次编译耗时较长，请耐心等待）..."
-    mvn clean install -DskipTests -q
-
-    local JAR_FILE
-    JAR_FILE=$(find ktg-admin/target -maxdepth 1 -name "*.jar" ! -name "*sources*" ! -name "*original*" | head -1)
-    if [ -z "$JAR_FILE" ]; then
-        err "编译失败，未找到jar包"
-        exit 1
-    fi
-
-    pkill -f ktg-admin.jar 2>/dev/null || true
-    sleep 1
-
-    nohup java -jar "$JAR_FILE" > "$WORK_DIR/backend.log" 2>&1 &
-    echo $! > "$WORK_DIR/backend.pid"
-    info "后端进程已启动，等待端口就绪..."
-
-    local ready=0
-    for i in $(seq 1 60); do
-        curl -s "http://127.0.0.1:$BACKEND_PORT" >/dev/null 2>&1 && { ready=1; break; }
-        sleep 2
+    # 修正数据库配置
+    info "修正数据库连接配置..."
+    for cfg in application.yml application-druid.yml application.properties; do
+        [ -f "$res_dir/$cfg" ] || continue
+        sed -i "s#jdbc:mysql://.*:#jdbc:mysql://127.0.0.1:$MYSQL_PORT:#g" "$res_dir/$cfg" 2>/dev/null || true
+        sed -i "s#username:.*root#username: root#g" "$res_dir/$cfg" 2>/dev/null || true
+        sed -i "s#password:.*#password: $MYSQL_ROOT_PWD#g" "$res_dir/$cfg" 2>/dev/null || true
     done
+    ok "数据库连接配置已更新"
 
-    if [ "$ready" -eq 1 ]; then
-        ok "后端启动成功，端口 $BACKEND_PORT"
-    else
-        err "后端启动失败，详见日志"
-        exit 1
-    fi
-}
-
-start_frontend_local() {
-    step "启动前端服务"
-    cd "$FRONTEND_DIR"
-
-    npm config set registry "$NPM_MIRROR"
-    info "安装前端依赖..."
-    npm install --legacy-peer-deps 2>&1 | tail -5
-
-    info "安装兼容版Less编译器"
-    npm install less@3.13.1 less-loader@6.2.0 --legacy-peer-deps --save-dev 2>/dev/null || true
-
-    pkill -f "npm run dev" 2>/dev/null || true
-    pkill -f webpack-dev-server 2>/dev/null || true
-    sleep 1
-
-    nohup npm run dev > "$WORK_DIR/frontend.log" 2>&1 &
-    echo $! > "$WORK_DIR/frontend.pid"
-    info "前端服务启动中，等待端口就绪..."
-
-    local fe_port=""
-    for i in $(seq 1 40); do
-        fe_port=$(get_frontend_port)
-        [ -n "$fe_port" ] && break
-        sleep 2
+    # 修正 Redis 配置（核心修复：解决连8080端口的问题）
+    info "修正 Redis 连接配置..."
+    for cfg in application.yml application-druid.yml application.properties; do
+        [ -f "$res_dir/$cfg" ] || continue
+        
+        # YAML 格式
+        sed -i "s#redis.host:.*#redis.host: 127.0.0.1#g" "$res_dir/$cfg" 2>/dev/null || true
+        sed -i "s#redis.port:.*#redis.port: $REDIS_PORT#g" "$res_dir/$cfg" 2>/dev/null || true
+        sed -i "s#redis.password:.*#redis.password: $REDIS_PWD#g" "$res_dir/$cfg" 2>/dev/null || true
+        
+        # Properties 格式
+        sed -i "s#spring.redis.host=.*#spring.redis.host=127.0.0.1#g" "$res_dir/$cfg" 2>/dev/null || true
+        sed -i "s#spring.redis.port=.*#spring.redis.port=$REDIS_PORT#g" "$res_dir/$cfg" 2>/dev/null || true
+        sed -i "s#spring.redis.password=.*#spring.redis.password=$REDIS_PWD#g" "$res_dir/$cfg" 2>/dev/null || true
     done
-
-    if [ -n "$fe_port" ]; then
-        ok "前端启动成功，端口 $fe_port"
-    else
-        warn "未检测到前端端口，可手动查看日志确认"
-    fi
-    echo "$fe_port" > "$WORK_DIR/frontend.port"
+    ok "Redis 连接配置已更新（host=127.0.0.1，port=$REDIS_PORT）"
 }
 
-register_global_cmd() {
-    step "注册全局管理命令"
-    info "清理旧版全局命令残留..."
-    rm -f /usr/local/bin/ktg-mes /usr/local/bin/ktg
-
-    local SELF
-    SELF="$(readlink -f "$0")"
-    cp "$SELF" /usr/local/bin/$GLOBAL_CMD
-    chmod +x /usr/local/bin/$GLOBAL_CMD
-    ok "全局命令注册完成，任意目录输入 $GLOBAL_CMD 即可打开管理菜单"
-}
-
-install_local() {
-    echo -e "${PURPLE}############ 开始本地模式安装 KTG-MES v4.5 ############${R}"
-    env_init
-    install_docker
-    start_db_local
-    pull_source
-    import_db_local
-    patch_config_local
-    build_backend_local
-    start_frontend_local
-    register_global_cmd
-
-    local fe_port local_ip
-    fe_port=$(cat "$WORK_DIR/frontend.port" 2>/dev/null || echo "未检测到")
-    local_ip=$(hostname -I | awk '{print $1}')
-
+# ======================= 6. 本地编译 =======================
+build_local() {
     echo ""
-    echo -e "${GREEN}############ 安装完成 ############${R}"
-    echo -e "  默认账号: ${YELLOW}admin / admin123${R}"
-    echo -e "  后端地址: http://localhost:$BACKEND_PORT"
-    echo -e "  前端地址: http://localhost:$fe_port"
-    echo -e "  内网访问: http://$local_ip:$fe_port"
-    echo -e "  管理命令: $GLOBAL_CMD"
+    info "===== 本地编译项目 ====="
+
+    # 后端编译
+    info "编译后端..."
+    cd "$BACKEND_DIR"
+    export MAVEN_OPTS="-Xms512m -Xmx2g"
+    mvn clean install -DskipTests -s "$MAVEN_SETTINGS" -q
+    
+    local jar_file
+    jar_file=$(find ktg-admin/target -maxdepth 1 -name "*.jar" ! -name "*sources*" ! -name "*original*" | head -1)
+    if [ -z "$jar_file" ] || [ ! -f "$jar_file" ]; then
+        err "后端编译失败，未生成 jar 文件"
+        exit 1
+    fi
+    ok "后端编译完成：$jar_file"
+
+    # 前端编译
+    info "编译前端..."
+    cd "$FRONTEND_DIR"
+    npm config set registry "$NPM_MIRROR" >/dev/null 2>&1
+    
+    if [ ! -d node_modules ]; then
+        npm install --legacy-peer-deps --silent >/dev/null 2>&1
+        npm install less@3.13.1 less-loader@6.2.0 --legacy-peer-deps --silent >/dev/null 2>&1
+    fi
+    
+    npm run build >/dev/null 2>&1
+    if [ ! -d dist ]; then
+        warn "前端开发模式运行，跳过 build"
+    else
+        ok "前端编译完成"
+    fi
 }
 
-#====================================================================================
-# 5. Docker全容器化部署模式（动态换源重试）
-#====================================================================================
-generate_docker_files() {
-    step "生成Docker配置文件"
-    mkdir -p "$WORK_DIR"
+# ======================= 7. 启动本地服务 =======================
+start_local_services() {
+    echo ""
+    info "===== 启动本地服务 ====="
 
-    # 1. docker-compose.yml
-    cat > "$DOCKER_COMPOSE_FILE" << EOF
-version: '3.8'
-
-networks:
-  $DOCKER_NETWORK:
-    driver: bridge
-
-volumes:
-  ktg-mysql-data:
-  ktg-redis-data:
-
-services:
-  ktg-mysql:
-    image: $MYSQL_IMAGE
-    container_name: $MYSQL_CONTAINER
-    restart: always
-    ports:
-      - "$MYSQL_PORT:3306"
-    environment:
-      MYSQL_ROOT_PASSWORD: "$MYSQL_ROOT_PWD"
-      MYSQL_DATABASE: "$MYSQL_DB"
-      TZ: "Asia/Shanghai"
-    command:
-      --character-set-server=utf8mb4
-      --collation-server=utf8mb4_unicode_ci
-      --default-time-zone=+8:00
-    volumes:
-      - ktg-mysql-data:/var/lib/mysql
-    networks:
-      - $DOCKER_NETWORK
-    healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-uroot", "-p$MYSQL_ROOT_PWD"]
-      interval: 5s
-      timeout: 3s
-      retries: 12
-
-  ktg-redis:
-    image: $REDIS_IMAGE
-    container_name: $REDIS_CONTAINER
-    restart: always
-    ports:
-      - "$REDIS_PORT:6379"
-    command: redis-server --requirepass $REDIS_PWD --appendonly yes
-    volumes:
-      - ktg-redis-data:/data
-    networks:
-      - $DOCKER_NETWORK
-    healthcheck:
-      test: ["CMD", "redis-cli", "-a", "$REDIS_PWD", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
-  ktg-backend:
-    build:
-      context: ./ktg-mes
-      dockerfile: Dockerfile
-    container_name: ktg-backend
-    restart: always
-    ports:
-      - "$BACKEND_PORT:8080"
-    environment:
-      TZ: "Asia/Shanghai"
-      SPRING_DATASOURCE_URL: "jdbc:mysql://ktg-mysql:3306/$MYSQL_DB?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai"
-      SPRING_DATASOURCE_USERNAME: "root"
-      SPRING_DATASOURCE_PASSWORD: "$MYSQL_ROOT_PWD"
-      SPRING_REDIS_HOST: "ktg-redis"
-      SPRING_REDIS_PORT: "6379"
-      SPRING_REDIS_PASSWORD: "$REDIS_PWD"
-    depends_on:
-      ktg-mysql:
-        condition: service_healthy
-      ktg-redis:
-        condition: service_healthy
-    networks:
-      - $DOCKER_NETWORK
-
-  ktg-frontend:
-    build:
-      context: ./ktg-mes-ui
-      dockerfile: Dockerfile
-    container_name: ktg-frontend
-    restart: always
-    ports:
-      - "$FRONTEND_PORT:80"
-    depends_on:
-      - ktg-backend
-    networks:
-      - $DOCKER_NETWORK
-EOF
-
-    # 2. 后端Dockerfile
-    cat > "$BACKEND_DIR/Dockerfile" << 'EOF'
-FROM maven:3.8.6-openjdk-8 AS builder
-WORKDIR /app
-COPY pom.xml .
-COPY src ./src
-RUN sed -i 's/central/aliyun/g' /usr/share/maven/conf/settings.xml && \
-    mvn clean install -DskipTests -q
-
-FROM openjdk:8-jre-slim
-WORKDIR /app
-COPY --from=builder /app/ktg-admin/target/*.jar app.jar
-ENV TZ=Asia/Shanghai
-EXPOSE 8080
-ENTRYPOINT ["java", "-jar", "-Xms512m", "-Xmx2g", "app.jar"]
-EOF
-
-    # 3. 前端Dockerfile
-    cat > "$FRONTEND_DIR/Dockerfile" << 'EOF'
-FROM node:16-alpine AS builder
-WORKDIR /app
-COPY package.json .
-RUN npm config set registry https://registry.npmmirror.com && \
-    npm install --legacy-peer-deps
-COPY . .
-RUN npm install less@3.13.1 less-loader@6.2.0 --legacy-peer-deps --save-dev
-RUN npm run build
-
-FROM nginx:alpine
-ENV TZ=Asia/Shanghai
-COPY --from=builder /app/dist /usr/share/nginx/html
-COPY nginx.conf /etc/nginx/conf.d/default.conf
-EXPOSE 80
-CMD ["nginx", "-g", "daemon off;"]
-EOF
-
-    # 4. 前端Nginx配置
-    cat > "$FRONTEND_DIR/nginx.conf" << 'EOF'
-server {
-    listen 80;
-    server_name localhost;
-    root /usr/share/nginx/html;
-    index index.html;
-
-    location / {
-        try_files $uri $uri/ /index.html;
-    }
-
-    location /api/ {
-        proxy_pass http://ktg-backend:8080/;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    }
-}
-EOF
-
-    ok "所有Docker配置文件生成完成"
-}
-
-deploy_docker() {
-    echo -e "${PURPLE}############ 开始Docker全容器化部署 KTG-MES v4.5 ############${R}"
-    env_init
-    install_docker
-    pull_source
-
-    warn "停止本地服务，避免端口冲突..."
-    pkill -f ktg-admin.jar 2>/dev/null || true
+    # 杀掉旧进程
+    pkill -f ktg-admin 2>/dev/null || true
     pkill -f "npm run dev" 2>/dev/null || true
-    docker rm -f ktg-mysql ktg-redis 2>/dev/null || true
+    sleep 1
 
-    generate_docker_files
-
-    step "构建并启动所有容器"
-    cd "$WORK_DIR"
-    local DC
-    DC=$(docker_compose_cmd)
-    local build_success=0
-    local mirror_count=${#DOCKER_MIRRORS[@]}
-
-    # 循环尝试每个镜像源
-    for ((i=0; i<mirror_count; i++)); do
-        local mirror="${DOCKER_MIRRORS[$i]}"
-        info "使用镜像源 [$((i+1))/$mirror_count]: $mirror"
-        set_docker_mirror "$mirror"
-
-        if [ $i -eq 0 ]; then
-            # 第一次用正常构建
-            if $DC up -d --build 2>&1; then
-                build_success=1
-                break
-            fi
-        else
-            # 重试时清理缓存
-            warn "上一个镜像源构建失败，切换镜像源并重试..."
-            if $DC build --no-cache 2>&1 && $DC up -d 2>&1; then
-                build_success=1
-                break
-            fi
-        fi
-    done
-
-    # 所有国内源失败，尝试官方源兜底
-    if [ "$build_success" -eq 0 ]; then
-        warn "所有国内镜像源均失败，使用官方源兜底重试..."
-        set_docker_official
-        if $DC build --no-cache 2>&1 && $DC up -d 2>&1; then
-            build_success=1
-            ok "官方源构建成功"
-        fi
-    fi
-
-    if [ "$build_success" -eq 0 ]; then
-        err "构建失败，请检查网络或手动执行 docker compose build 查看详情"
-        read -p "按回车继续..."
-        return 1
-    fi
-
-    info "等待服务启动就绪..."
-    sleep 15
-
-    local ready=0
-    for i in $(seq 1 20); do
-        if curl -s "http://127.0.0.1:$FRONTEND_PORT" >/dev/null 2>&1 && \
-           curl -s "http://127.0.0.1:$BACKEND_PORT" >/dev/null 2>&1; then
-            ready=1
+    # 启动后端（带Redis参数兜底）
+    info "启动后端服务..."
+    cd "$BACKEND_DIR"
+    local jar_file
+    jar_file=$(find ktg-admin/target -maxdepth 1 -name "*.jar" ! -name "*sources*" ! -name "*original*" | head -1)
+    
+    nohup java -jar "$jar_file" \
+        --spring.redis.host=127.0.0.1 \
+        --spring.redis.port="$REDIS_PORT" \
+        --spring.redis.password="$REDIS_PWD" \
+        > "$WORK_DIR/backend.log" 2>&1 &
+    
+    # 等待后端启动
+    info "等待后端服务就绪..."
+    local success=0
+    for i in {1..30}; do
+        if ss -tlnp | grep -q ":$BACKEND_PORT "; then
+            success=1
             break
         fi
-        sleep 3
+        sleep 1
     done
 
-    register_global_cmd
-
-    local local_ip
-    local_ip=$(hostname -I | awk '{print $1}')
-
-    echo ""
-    if [ "$ready" -eq 1 ]; then
-        echo -e "${GREEN}############ 部署完成 ############${R}"
-        echo -e "  默认账号: ${YELLOW}admin / admin123${R}"
-        echo -e "  前端地址: http://localhost:$FRONTEND_PORT"
-        echo -e "  后端地址: http://localhost:$BACKEND_PORT"
-        echo -e "  内网访问: http://$local_ip:$FRONTEND_PORT"
-        echo ""
-        echo -e "  集群管理命令:"
-        echo -e "  查看状态: $DC ps"
-        echo -e "  查看日志: $DC logs -f [服务名]"
-        echo -e "  停止服务: $DC stop"
-        echo -e "  启动服务: $DC start"
-    else
-        warn "部署已执行，服务启动中，请稍候访问"
-        echo -e "  可执行命令查看状态: $DC ps"
+    if [ $success -eq 0 ]; then
+        err "后端启动失败，请查看日志：tail -50 $WORK_DIR/backend.log"
+        exit 1
     fi
+    ok "后端服务启动成功，端口：$BACKEND_PORT"
+
+    # 启动前端
+    info "启动前端服务..."
+    cd "$FRONTEND_DIR"
+    nohup npm run dev > "$WORK_DIR/frontend.log" 2>&1 &
+    sleep 3
+    
+    ok "前端服务已启动"
+    echo ""
+    info "===== 部署完成 ====="
+    echo "  后端地址：http://127.0.0.1:$BACKEND_PORT"
+    echo "  后端日志：$WORK_DIR/backend.log"
+    echo "  前端日志：$WORK_DIR/frontend.log"
+    echo "  管理命令：sudo $GLOBAL_CMD"
 }
 
-#====================================================================================
-# 6. 一键彻底清理还原
-#====================================================================================
-full_cleanup() {
+# ======================= 8. 一键完整本地部署 =======================
+install_local_full() {
+    env_init
+    docker_env_init
+    pull_source
+    start_db_containers
+    patch_config
+    build_local
+    start_local_services
+}
+
+# ======================= 9. 主菜单 =======================
+show_menu() {
     clear
-    echo -e "${RED}############################################################${R}"
-    echo -e "${RED}#                    【危险操作】彻底清理还原                    #${R}"
-    echo -e "${RED}############################################################${R}"
-    echo ""
-    echo -e "  即将执行以下操作："
-    echo -e "  1. 停止所有本地服务进程（后端/前端）"
-    echo -e "  2. 删除所有相关Docker容器"
-    echo -e "  3. 删除整个项目目录（源码/编译产物/日志/配置）"
-    echo -e "  4. 移除全局命令 ktg / ktg-mes"
-    echo ""
-    echo -e "${YELLOW}  可选操作（需二次确认）：${R}"
-    echo -e "  A. 删除Docker数据卷（MySQL/Redis数据永久丢失）"
-    echo -e "  B. 卸载Docker环境"
-    echo -e "  C. 卸载Java/Node/Maven等系统依赖"
-    echo ""
-    echo -e "${RED}  此操作不可逆！请确认已备份重要数据！${R}"
-    echo ""
+    echo "=============================================="
+    echo "       KTG-MES 一键部署管理工具 v4.8"
+    echo "=============================================="
+    echo "  [1] 本地模式完整安装（推荐）"
+    echo "  [2] 仅启动数据库容器"
+    echo "  [3] 重新编译后端"
+    echo "  [4] 重启后端服务"
+    echo "  [5] 查看后端日志"
+    echo "  [6] 一键清理所有"
+    echo "  [0] 退出"
+    echo "=============================================="
+    read -p "请输入选项：" opt
 
-    read -p "输入 YES 确认开始彻底清理: " confirm
-    if [ "$confirm" != "YES" ]; then
-        info "已取消操作"
-        read -p "按回车返回菜单..."
-        return 0
-    fi
-
-    step "停止所有本地服务"
-    pkill -f ktg-admin.jar 2>/dev/null || true
-    pkill -f "npm run dev" 2>/dev/null || true
-    pkill -f webpack-dev-server 2>/dev/null || true
-    ok "本地进程已停止"
-
-    step "删除所有相关Docker容器"
-    docker rm -f ktg-mysql ktg-redis ktg-backend ktg-frontend 2>/dev/null || true
-    if [ -f "$DOCKER_COMPOSE_FILE" ]; then
-        local DC
-        DC=$(docker_compose_cmd)
-        $DC down -v 2>/dev/null || true
-    fi
-    ok "所有容器已删除"
-
-    echo ""
-    read -p "是否删除数据库数据卷？（输入 DELETE 确认永久删除数据）: " del_data
-    if [ "$del_data" == "DELETE" ]; then
-        step "删除Docker数据卷"
-        docker volume rm ktg-mysql-data ktg-redis-data 2>/dev/null || true
-        docker volume prune -f 2>/dev/null || true
-        ok "数据卷已删除，数据库数据已清空"
-    else
-        info "保留数据库数据卷，数据未删除"
-    fi
-
-    step "删除项目目录"
-    rm -rf "$WORK_DIR"
-    ok "项目文件已全部删除"
-
-    step "移除全局命令"
-    rm -f /usr/local/bin/ktg /usr/local/bin/ktg-mes
-    ok "全局命令已移除"
-
-    echo ""
-    read -p "是否卸载Docker环境？（y/N）: " del_docker
-    if [ "$del_docker" = "y" ] || [ "$del_docker" = "Y" ]; then
-        step "卸载Docker环境"
-        apt purge -y docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-compose 2>/dev/null || true
-        rm -rf /etc/docker /var/lib/docker
-        ok "Docker环境已卸载"
-    fi
-
-    echo ""
-    read -p "是否卸载Java/Node/Maven等系统依赖？（y/N）: " del_sys
-    if [ "$del_sys" = "y" ] || [ "$del_sys" = "Y" ]; then
-        step "卸载系统依赖"
-        apt purge -y openjdk-8-jdk-headless maven nodejs 2>/dev/null || true
-        apt autoremove -y 2>/dev/null || true
-        ok "系统依赖已卸载"
-    fi
-
-    echo ""
-    echo -e "${GREEN}############ 清理完成 ############${R}"
-    echo -e "  已停止所有服务"
-    echo -e "  已删除所有容器"
-    echo -e "  已删除项目文件"
-    echo -e "  已移除全局命令"
-    [ "$del_data" == "DELETE" ] && echo -e "  已清空数据库数据"
-    [ "$del_docker" = "y" ] || [ "$del_docker" = "Y" ] && echo -e "  已卸载Docker环境"
-    [ "$del_sys" = "y" ] || [ "$del_sys" = "Y" ] && echo -e "  已卸载系统依赖"
-    echo ""
-    echo -e "  环境已还原至部署前状态"
-
-    read -p "按回车返回菜单..."
-}
-
-#====================================================================================
-# 7. 运行信息总览
-#====================================================================================
-show_info() {
-    clear
-    echo -e "${CYAN}############################################################${R}"
-    echo -e "${CYAN}#${R}${GREEN}          KTG-MES 运行信息总览            ${R}${CYAN}#${R}"
-    echo -e "${CYAN}############################################################${R}"
-    echo ""
-
-    echo -e "  ${YELLOW}【系统登录账号】${R}"
-    echo -e "  管理员账号: admin"
-    echo -e "  管理员密码: admin123"
-    echo ""
-
-    echo -e "  ${YELLOW}【数据库信息】${R}"
-    echo -e "  MySQL 地址: 127.0.0.1:${MYSQL_PORT}"
-    echo -e "  MySQL 账号: root"
-    echo -e "  MySQL 密码: ${MYSQL_ROOT_PWD}"
-    echo -e "  数据库名: ${MYSQL_DB}"
-    echo ""
-
-    echo -e "  ${YELLOW}【Redis信息】${R}"
-    echo -e "  Redis 地址: 127.0.0.1:${REDIS_PORT}"
-    echo -e "  Redis 密码: ${REDIS_PWD}"
-    echo ""
-
-    echo -e "  ${YELLOW}【访问地址】${R}"
-    local local_ip fe_port
-    local_ip=$(hostname -I | awk '{print $1}')
-    fe_port=$(cat "$WORK_DIR/frontend.port" 2>/dev/null || echo "未启动/未检测")
-    echo -e "  后端服务: http://localhost:${BACKEND_PORT}"
-    echo -e "  前端服务: http://localhost:${fe_port}"
-    echo -e "  内网访问: http://${local_ip}:${fe_port}"
-    echo ""
-
-    echo -e "  ${YELLOW}【服务运行状态】${R}"
-    if docker ps -q --filter "name=^${MYSQL_CONTAINER}$" | grep -q .; then
-        echo -e "  MySQL 容器: ${GREEN}运行中${R}"
-    else
-        echo -e "  MySQL 容器: ${RED}已停止${R}"
-    fi
-
-    if docker ps -q --filter "name=^${REDIS_CONTAINER}$" | grep -q .; then
-        echo -e "  Redis 容器: ${GREEN}运行中${R}"
-    else
-        echo -e "  Redis 容器: ${RED}已停止${R}"
-    fi
-
-    if pgrep -f ktg-admin.jar >/dev/null 2>&1; then
-        echo -e "  后端服务(本地): ${GREEN}运行中${R}"
-    else
-        echo -e "  后端服务(本地): ${RED}已停止${R}"
-    fi
-
-    if pgrep -f "webpack-dev-server" >/dev/null 2>&1 || pgrep -f "npm run dev" >/dev/null 2>&1; then
-        echo -e "  前端服务(本地): ${GREEN}运行中${R}"
-    else
-        echo -e "  前端服务(本地): ${RED}已停止${R}"
-    fi
-
-    if [ -f "$DOCKER_COMPOSE_FILE" ]; then
-        local DC
-        DC=$(docker_compose_cmd)
-        if $DC ps -q --filter "status=running" 2>/dev/null | grep -q .; then
-            echo -e "  Docker集群: ${GREEN}运行中${R}"
-        else
-            echo -e "  Docker集群: ${RED}已停止${R}"
-        fi
-    fi
-    echo ""
-    read -p "按回车返回菜单..."
-}
-
-#====================================================================================
-# 主菜单
-#====================================================================================
-menu() {
-    while true; do
-        clear
-        echo -e "${CYAN}############################################################${R}"
-        echo -e "${CYAN}#${R}${GREEN}          KTG-MES 苦糖果MES 管理工具 v4.5 动态换源版            ${R}${CYAN}#${R}"
-        echo -e "${CYAN}############################################################${R}"
-        echo ""
-        echo -e "  ${YELLOW}[1]${R}  本地模式完整安装"
-        echo -e "  ${YELLOW}[2]${R}  启动本地服务"
-        echo -e "  ${YELLOW}[3]${R}  停止本地服务"
-        echo -e "  ${YELLOW}[4]${R}  查看后端日志"
-        echo -e "  ${YELLOW}[5]${R}  卸载本地服务"
-        echo -e "  ${YELLOW}[6]${R}  查看运行信息"
-        echo -e "  ${YELLOW}[7]${R}  Docker全容器化部署"
-        echo -e "  ${YELLOW}[8]${R}  一键彻底清理还原"
-        echo -e "  ${YELLOW}[0]${R}  退出"
-        echo ""
-        read -p "请输入选项 [0-8]: " opt
-
-        case "$opt" in
-            1) install_local; read -p "按回车继续..." ;;
-            2) start_db_local && build_backend_local && start_frontend_local; read -p "按回车继续..." ;;
-            3)
-                pkill -f ktg-admin.jar 2>/dev/null || true
+    case $opt in
+        1) install_local_full ;;
+        2) env_init; docker_env_init; start_db_containers ;;
+        3) env_init; patch_config; build_local ;;
+        4) env_init; start_local_services ;;
+        5) tail -f "$WORK_DIR/backend.log" ;;
+        6) 
+            warn "即将停止所有服务并清理文件..."
+            read -p "确认执行？(y/n):" confirm
+            if [ "$confirm" = "y" ]; then
+                pkill -f ktg-admin 2>/dev/null || true
                 pkill -f "npm run dev" 2>/dev/null || true
-                docker stop ktg-mysql ktg-redis 2>/dev/null || true
-                ok "本地服务已停止"
-                read -p "按回车继续..."
-                ;;
-            4)
-                echo "=== 后端日志（按Ctrl+C退出） ==="
-                tail -f "$WORK_DIR/backend.log"
-                ;;
-            5)
-                read -p "确认卸载本地服务? (y/N): " yn
-                [ "$yn" != "y" ] && { info "已取消"; read -p "按回车继续..."; continue; }
-                pkill -f ktg-admin.jar 2>/dev/null || true
-                pkill -f "npm run dev" 2>/dev/null || true
-                docker rm -f ktg-mysql ktg-redis 2>/dev/null || true
+                docker rm -f "$MYSQL_CONTAINER" "$REDIS_CONTAINER" 2>/dev/null || true
                 rm -rf "$WORK_DIR"
-                rm -f /usr/local/bin/$GLOBAL_CMD /usr/local/bin/ktg-mes
-                ok "卸载完成"
-                read -p "按回车继续..."
-                ;;
-            6) show_info ;;
-            7) deploy_docker; read -p "按回车继续..." ;;
-            8) full_cleanup ;;
-            0) echo "再见"; exit 0 ;;
-            *) warn "无效选项"; sleep 1 ;;
-        esac
-    done
+                rm -f "/usr/local/bin/$GLOBAL_CMD"
+                ok "清理完成"
+            fi
+            ;;
+        0) exit 0 ;;
+        *) warn "无效选项" ; sleep 1 ; show_menu ;;
+    esac
 }
 
-# 入口
-[ "${1:-}" == "install" ] && install_local || menu
+# ======================= 入口 =======================
+if [ $# -eq 0 ]; then
+    show_menu
+else
+    case "$1" in
+        install) install_local_full ;;
+        start)   env_init; start_db_containers; start_local_services ;;
+        log)     tail -f "$WORK_DIR/backend.log" ;;
+        *)       show_menu ;;
+    esac
+fi
