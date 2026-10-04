@@ -687,8 +687,9 @@ env_init() {
 
     # 基础工具（v4.8 在 docker 缺失时不会安装任何东西，直接崩）
     if ! cmd_exists curl || ! cmd_exists git || ! cmd_exists unzip || ! cmd_exists wget; then
-        info "安装基础工具（curl wget git unzip）..."
-        pkg_install curl wget git unzip ca-certificates || warn "部分基础工具安装失败，请检查网络"
+        info "安装基础工具（curl wget git unzip psmisc）..."
+        # psmisc 提供 fuser，用于按端口结束进程（stop 逻辑依赖它）
+        pkg_install curl wget git unzip ca-certificates psmisc || warn "部分基础工具安装失败，请检查网络"
     fi
 
     install_docker
@@ -1225,12 +1226,53 @@ build_local() {
 }
 
 # ======================= 8. 启动/停止服务 =======================
+# 按端口结束进程（fuser 优先，lsof 兜底）。
+# 关键：绝不使用 pkill -f 按进程名匹配——curl|bash 执行时脚本全文会进入父 bash 的
+# 命令行参数，pkill -f 'ktg-admin.*\.jar' 会匹配到父 bash/sudo 进程，导致
+# 进程被 SIGTERM 杀死、终端显示 "Terminated" 的自杀事故。
+kill_port() {
+    local port="$1" pid
+    if cmd_exists fuser; then
+        fuser -k "${port}/tcp" 2>/dev/null || true
+        return 0
+    fi
+    if cmd_exists lsof; then
+        pid="$(lsof -ti tcp:"$port" 2>/dev/null || true)"
+        if [ -n "$pid" ]; then
+            kill $pid 2>/dev/null || true
+        fi
+    fi
+}
+
+stop_backend() {
+    local pid
+    if [ -f "$BACKEND_PID_FILE" ]; then
+        pid="$(cat "$BACKEND_PID_FILE" 2>/dev/null || true)"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    fi
+    kill_port "$BACKEND_PORT"
+    rm -f "$BACKEND_PID_FILE"
+}
+
+stop_frontend() {
+    local pid
+    if [ -f "$FRONTEND_PID_FILE" ]; then
+        pid="$(cat "$FRONTEND_PID_FILE" 2>/dev/null || true)"
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    fi
+    # npm run dev 的真正服务进程是子进程 node(vue-cli-service)，按端口兜底结束
+    kill_port "$FRONTEND_PORT"
+    rm -f "$FRONTEND_PID_FILE"
+}
+
 stop_local_services() {
-    local killed=0
-    if pkill -f 'ktg-admin.*\.jar' 2>/dev/null; then killed=1; fi
-    if pkill -f 'vue-cli-service serve' 2>/dev/null; then killed=1; fi
-    rm -f "$BACKEND_PID_FILE" "$FRONTEND_PID_FILE"
-    [ "$killed" -eq 1 ] && info "已停止后端/前端进程" || true
+    stop_backend
+    stop_frontend
+    info "已停止后端/前端进程"
     return 0
 }
 
@@ -1242,12 +1284,12 @@ start_backend() {
     fi
 
     info "停止旧的后端进程..."
-    pkill -f 'ktg-admin.*\.jar' 2>/dev/null || true
+    stop_backend
     # wait_port_free 失败时返回非 0；用 `if !` 正好利用了“条件上下文豁免 errexit”，
     # 不会因“端口仍被占用”而中断脚本。
     if ! wait_port_free "$BACKEND_PORT"; then
         warn "端口 $BACKEND_PORT 仍被占用，强制结束占用进程"
-        if cmd_exists fuser; then fuser -k "${BACKEND_PORT}/tcp" 2>/dev/null || true; fi
+        kill_port "$BACKEND_PORT"
         sleep 2
     fi
 
@@ -1291,9 +1333,11 @@ start_frontend() {
     [ -d node_modules ] || { err "前端依赖未安装，请先执行：$0 build"; return 1; }
 
     info "停止旧的前端进程..."
-    pkill -f 'vue-cli-service serve' 2>/dev/null || true
+    stop_frontend
     if ! wait_port_free "$FRONTEND_PORT"; then
         warn "端口 $FRONTEND_PORT 被占用（后端默认 8080，前端 vue.config.js 默认 80，注意区分）"
+        kill_port "$FRONTEND_PORT"
+        sleep 2
     fi
 
     # vue.config.js: port = process.env.port || process.env.npm_config_port || 80
